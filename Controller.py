@@ -125,8 +125,17 @@ def main():
         st.markdown(f"**Extracted features**")
         annotated_text(*[(meas, feat, features_colors[feat]) for meas, feat in zip(feature, feature.index) if isinstance(meas, str)])
     
-    with st.sidebar:    
-        submit = st.button("Submit", type="primary")
+    with st.sidebar:
+        col1, col2 = st.columns(2)
+        with col1:
+            submit = st.button("Submit", type="primary")
+        with col2:
+            st.download_button(
+                label="Download JSON",
+                data=json.dumps(acceptances),
+                file_name='acceptances.json',
+                mime='application/json',
+            )
         if submit:
             update_acceptance(toggles)
             st.success("Submitted!")
