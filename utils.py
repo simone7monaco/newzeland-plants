@@ -18,7 +18,7 @@ duplicate_words = []
 for word in set(all_words):
 	if (all_words == word).sum() > 1:
 		duplicate_words.append(word)
-print(duplicate_words)
+
 words_to_remove = []
 # remove all words starting with petal, flower, fruit, seed with a letter after different from s. Select the entire word up to the first space or punctuation (,;.) excluded
 reg_exp = r'(petal|flower|fruit|seed)[a-rt-z]+[^\s;,.\)]'
