@@ -7,7 +7,7 @@ from pathlib import Path
 species = pd.read_excel(Path(__file__).parent / "plant_info.xlsx").set_index('SpeciesName')
 species['Features'] = species['Features'].fillna('')
 
-extra_features_df = pd.read_excel("Words before and after traits.xlsx", sheet_name="Words", skiprows=1)
+extra_features_df = pd.read_excel("Words before and after traits_v1.xlsx", sheet_name="Words", skiprows=1)
 extra_features_df = extra_features_df[:extra_features_df[extra_features_df.Stature.eq('Following words')].index[0]].applymap(lambda s:s.lower() if type(s) == str else s)
 
 extra_features = extra_features_df.to_dict('list')
@@ -69,31 +69,30 @@ def extract_features(i, feats:list, wordmeasure_distance=100): # TODO: automatic
 	for feat in feats:
 		if len(feat) < 1:
 			continue
-		found = False
-		for key, values in extra_features.items():
-			feat = feat.replace(',', ' ')
-			# remove any of .,; after one of the measures (cm, mm, dm, m), keeping the measure
-			feat = re.sub(rf'{unit}[\.,;]', lambda x: x.group()[:-1], feat)
-			if any([w == wf for w in set(values) for wf in feat.lower().split()]):
-				if 'calyx' in feat.lower() and key != 'CalyxSize' or 'petiole' in feat.lower() and key != 'PetioleSize' or 'anther' in feat.lower() and key != 'AntherSize' or 'pedicel' in feat.lower() and key != 'PedicelSize':
-					continue
-				word_match = [w.lower() for w in feat.split() if w.lower() in set(values)][0]
-				
-				if found=='InflorescenceSize' and key == 'FlowerSize': # if inflorencence was already found, skip flower (e.g., "flower stem" associated with inflorescence only)
-					continue
-				if found=='FlowerSize' and key in ['StamenSize']: # avoid matching cases such as "Flowers large, white, about 8mm across, 4-petalled with 6 __stamens__"
-					continue
-				if found == 'FruitSize' and not any([w.lower() in feat.lower() for w in ['achene', 'cypsela']]):
-					continue
-				# measure is a number and a unit of measurement (e.g. 1.5 mm)
-				# can match forms like 1.5-2.5 mm, 1.5 – 2.5 mm, 1.5×2.5 mm
-				measure = re.search(full_regex, feat)
-				if measure:
+		# measure is a number and a unit of measurement (e.g. 1.5 mm)
+		feat = feat.replace(',', ' ')
+		measures = re.finditer(full_regex, feat)
+		for measure in measures:
+			found = None
+			measure_position = np.where(np.array(feat.lower().split()) == measure.group())[0][0]
+			for key, values in extra_features.items():
+				# remove any of .; after one of the measures (cm, mm, dm, m), keeping the measure
+				feat = re.sub(rf'{unit}[\.;]', lambda x: x.group()[:-1], feat)
+				if any([w == wf for w in set(values) for wf in feat.lower().split()]):
+					if 'calyx' in feat.lower() and key != 'CalyxSize' or 'petiole' in feat.lower() and key != 'PetioleSize' or 'anther' in feat.lower() and key != 'AntherSize' or 'pedicel' in feat.lower() and key != 'PedicelSize':
+						continue
+					word_match = [w.lower() for w in feat.split() if w.lower() in set(values)][0]
 					word_match_position = np.where(np.array(feat.lower().split()) == word_match)[0][0]
-					measure_position = np.where(np.array(feat.lower().split()) == measure.group())[0][0]
+					
+					if found=='InflorescenceSize' and key == 'FlowerSize': # if inflorencence was already found, skip flower (e.g., "flower stem" associated with inflorescence only)
+						continue
+					if found=='FlowerSize' and key in ['StamenSize']: # avoid matching cases such as "Flowers large, white, about 8mm across, 4-petalled with 6 __stamens__"
+						continue # TODO: can be avoided if considering only keywords before the measure?
+					if found == 'FruitSize' and not any([w.lower() in feat.lower() for w in ['achene', 'cypsela']]):
+						continue
 
 					if abs(word_match_position - measure_position) > wordmeasure_distance:
-						continue
+						continue # TODO: remove abs to enforce keyword before measure (not in Stature, other exceptions?)
 					if found:
 						if (any([w.lower() in feat.lower() for w in ['achene', 'cypsela']]) and {key, found[0]} == {'FruitSize', 'SeedSize'}) or\
 							{key, found[0]} == {'StigmaSize', 'StyleSize'}:
