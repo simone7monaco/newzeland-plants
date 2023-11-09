@@ -14,17 +14,6 @@ species['Features'] = species['Features'].fillna('')
 with open(Path(__file__).parent / "acceptances.json") as f:
     acceptances = json.load(f)
 
-def get_color(score, fixed_color=True):
-    from colorsys import rgb_to_hsv, hsv_to_rgb
-    if fixed_color: return colors[score.argmax()]
-    h = colors[score.argmax()].lstrip("#")
-
-    c = rgb_to_hsv(*tuple(int(h[i:i+2], 16) for i in (0, 2, 4)))
-    c = [c[0], c[1], 255-((255 - c[2]) * (score.max()))]
-    c = [int(ch) for ch in hsv_to_rgb(*c)]
-
-    return '#%02x%02x%02x' % tuple(c)
-
 def refresh_processed_features():
     processed_features = species.Features.apply(string_preprocessing).str.split(r'(?<!\sc)[.;]\s|;').reset_index().apply(lambda x: extract_features(x.SpeciesName, x.Features), axis=1)
     processed_features = processed_features.applymap(lambda x: '; '.join(x) if not isinstance(x, float) else x)
@@ -34,7 +23,7 @@ def refresh_processed_features():
     get_unlabelled_measures(processed_features)
 
     with open(Path(__file__).parent / "acceptances.json", "w") as f:
-        json.dump({sp: '' for sp in anomalies}, f) # TODO: is this available from utils?
+        json.dump({sp: '' for sp in anomalies}, f)
     return processed_features
 
 def update_acceptance(toggles):
@@ -43,8 +32,6 @@ def update_acceptance(toggles):
             acceptances[k] = 'correct'
         else:
             acceptances[k] = ''
-            # if acceptances.get(k, '') == 'correct':
-                # acceptances.pop(k)
     with open(Path(__file__).parent / "acceptances.json", "w") as f:
         json.dump(acceptances, f)
 
@@ -67,63 +54,68 @@ def main():
     with open(Path(__file__).parent / "acceptances.json") as f:
         acceptances = json.load(f)
         
+    if acceptances == {}:
+        st.warning("😎")
+        toggles = {}
+    else:
+        get_color = lambda i: sns.color_palette("husl", len(processed_features.columns)).as_hex()[i]
 
-    get_color = lambda i: sns.color_palette("husl", len(processed_features.columns)).as_hex()[i]
+        features_colors = {feat: get_color(i) for i, feat in enumerate(processed_features.columns)} | {'null': '#808080'}
 
-    features_colors = {feat: get_color(i) for i, feat in enumerate(processed_features.columns)} | {'null': '#808080'}
+        page_length = 25
+        processed_features_anom = processed_features[processed_features.index.isin(
+            # processed_features.index.intersection(acceptances.keys()))
+            acceptances.keys())]
+        page_number = st.selectbox("Page number", range(0, len(processed_features_anom), page_length), index=0)
 
-    page_length = 25
-    processed_features_anom = processed_features[processed_features.index.isin(acceptances.keys())]
-    page_number = st.selectbox("Page number", range(0, len(processed_features_anom), page_length), index=0)
+        processed_view = processed_features_anom.iloc[page_number:page_number+page_length]
+        st.text(f"Showing species from {page_number} to {page_number+page_length}")
+        toggles = {}
+        bar = st.progress(0)
+        for i, (species_name, feature) in enumerate(processed_view.iterrows()):
+            bar.progress(i/len(processed_view))
+            features_text = species.loc[species_name, 'Features'].replace('\xa0', ' ').replace('×', 'x').replace('–', '-')
+            if features_text == '': continue
+            # print in the center of the page a bold title with the shown species (ids from ** to **)
+            
 
-    processed_view = processed_features_anom.iloc[page_number:page_number+page_length]
-    st.text(f"Showing species from {page_number} to {page_number+page_length}")
-    toggles = {}
-    bar = st.progress(0)
-    for i, (species_name, feature) in enumerate(processed_view.iterrows()):
-        bar.progress(i/len(processed_view))
-        features_text = species.loc[species_name, 'Features'].replace('\xa0', ' ').replace('×', 'x').replace('–', '-')
-        if features_text == '': continue
-        # print in the center of the page a bold title with the shown species (ids from ** to **)
-        
+            # TODO: create 3 tabs, one with all the remaining texts, one with the accepted, one with the errors
+            if acceptances.get(species_name, '') == 'correct':
+                st.header(f":green[{species_name}]")
+                continue
 
-        # TODO: create 3 tabs, one with all the remaining texts, one with the accepted, one with the errors
-        if acceptances.get(species_name, '') == 'correct':
-            st.header(f":green[{species_name}]")
-            continue
+            st.header(f"{species_name}")
+            toggles[species_name] = st.toggle('Mark as correct', key=f"{species_name}_toggle", value=True if acceptances.get(species_name, '') == 'correct' else False) 
 
-        st.header(f"{species_name}")
-        toggles[species_name] = st.toggle('Mark as correct', key=f"{species_name}_toggle", value=True if acceptances.get(species_name, '') == 'correct' else False) 
+            
+            
 
-        
-        
+            measures_in_text = re.finditer(r'\d[\d\.\s\(\)x-]*[cmd]?m\s?(?![\d-\(\)])', features_text)
+            
+            detected_features = []
+            for match in measures_in_text:
+                which_feature = feature[feature.apply(lambda x: isinstance(x, str) and string_preprocessing(match.group()).strip() in x.split('; '))]
+                if which_feature.empty:
+                    detected_features.append(('null', match.group(), match.start(), match.end()))
+                else:
+                    for feat in which_feature.index:
+                        detected_features.append((feat, match.group(), match.start(), match.end()))
+            detected_features = sorted(detected_features, key=lambda x: x[2])
 
-        measures_in_text = re.finditer(r'\d[\d\.\s\(\)x-]*[cmd]?m\s?(?![\d-\(\)])', features_text)
-        
-        detected_features = []
-        for match in measures_in_text:
-            which_feature = feature[feature.apply(lambda x: isinstance(x, str) and string_preprocessing(match.group()).strip() in x.split('; '))]
-            if which_feature.empty:
-                detected_features.append(('null', match.group(), match.start(), match.end()))
-            else:
-                for feat in which_feature.index:
-                    detected_features.append((feat, match.group(), match.start(), match.end()))
-        detected_features = sorted(detected_features, key=lambda x: x[2])
+            coloured_text = []
+            last_found = 0
+            for feat, raw, start, end in detected_features:
+                coloured_text.append(features_text[last_found:start])
+                coloured_text.append((features_text[start:end], feat, features_colors[feat]))
+                last_found = end
 
-        coloured_text = []
-        last_found = 0
-        for feat, raw, start, end in detected_features:
-            coloured_text.append(features_text[last_found:start])
-            coloured_text.append((features_text[start:end], feat, features_colors[feat]))
-            last_found = end
-
-        if last_found != len(features_text):
-            coloured_text.append(features_text[last_found:])
-        
-        annotated_text(*coloured_text)
-        # write in bold
-        st.markdown(f"**Extracted features**")
-        annotated_text(*[(meas, feat, features_colors[feat]) for meas, feat in zip(feature, feature.index) if isinstance(meas, str)])
+            if last_found != len(features_text):
+                coloured_text.append(features_text[last_found:])
+            
+            annotated_text(*coloured_text)
+            # write in bold
+            st.markdown(f"**Extracted features**")
+            annotated_text(*[(meas, feat, features_colors[feat]) for meas, feat in zip(feature, feature.index) if isinstance(meas, str)])
     
     with st.sidebar:
         col1, col2 = st.columns(2)
