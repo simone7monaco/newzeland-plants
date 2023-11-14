@@ -8,7 +8,7 @@ species = pd.read_excel(Path(__file__).parent / "plant_info.xlsx").set_index('Sp
 species['Features'] = species['Features'].fillna('')
 
 extra_features_df = pd.read_excel("Words before and after traits_v2.xlsx", sheet_name="Words", skiprows=1)
-extra_features_df = extra_features_df[:extra_features_df[extra_features_df.Stature.eq('Following words')].index[0]].applymap(lambda s:s.lower() if type(s) == str else s)
+extra_features_df = extra_features_df[:extra_features_df[extra_features_df.Stature.eq('Following words')].index[0]].applymap(lambda s:s.lower().strip() if type(s) == str else s)
 
 extra_features = extra_features_df.to_dict('list')
 extra_features = {k.title().replace(' ', ''): [x for x in v if str(x) != 'nan'] for k, v in extra_features.items()}
@@ -41,12 +41,12 @@ full_regex = rf"({number}(-{number})?(-{number})?{unit}?x)?({number}(-{number})?
 
 
 def string_preprocessing(s):
-	s = s.replace('\xa0', ' ').replace('×', 'x').replace('–', '-') # remove non-breaking space and replace multiplication sign with x
+	s = s.replace('\xa0', ' ').replace('×', 'x').replace('–', '-').replace('·', '.') # remove non-breaking space and replace multiplication sign with x
 	s = re.sub(fr'-?\(-?{number}-?\)-?', '', s) # remove all parentesis surrounding a number (e.g. (-1.5))
 	s = s.replace('--', '-').replace('-.', '-').replace('..', '.')
 	s = s.replace('(', '').replace(')', '')
 	s = re.sub(r'\s(c|ca|o)\.', ' foo ', s) # remove all ' c.'
-	s = re.sub(r'\s+(?=[cmd]?m)', '', s) # remove all spaces before measures (mm, cm, dm, m, these strings only if padded by a space)
+	s = re.sub(r'(?<=\d)\s+(?=[cmd]?m)', '', s) # remove all spaces before measures (mm, cm, dm, m, these strings only if padded by a space)
 	s = re.sub(r'\s*-\s*', '-', s) # remove spaces around hyphens
 	s = re.sub(r'(?<=\d)\s*\.(?=\d)', '.', s) # remove spaces before dot if followed and preceded by a number
 	s = re.sub(r'(?<=\s)\.(?=\d)', '0.', s) # add a 0 before a dot if it is preceded by a space and a "not number" and followed by a number (e.g. foo .5 --> foo 0.5)
@@ -64,10 +64,9 @@ def string_preprocessing(s):
 	s = re.sub('|'.join(words_to_remove), '', s, flags=re.IGNORECASE) # remove words to remove
 	return s
 
-
 tmp = []
 anomalies = set() # species with anomalies
-def extract_features(i, feats:list, wordmeasure_distance=6): # TODO: automatic wordmeasure_distance
+def extract_features(i, feats:list, wordmeasure_distance=10): # TODO: automatic wordmeasure_distance
 	features = {}
 	for feat in feats:
 		if len(feat) < 1:
@@ -77,48 +76,55 @@ def extract_features(i, feats:list, wordmeasure_distance=6): # TODO: automatic w
 		measures = re.finditer(full_regex, feat)
 		for measure in measures:
 			found = None
-			measure_position = np.where(np.array(feat.lower().split()) == measure.group())[0][0]
+			# measure_position = len(re.findall(r'\s+', feats[0][:measure.span()[0]]))
 			for key, values in extra_features.items():
 				# remove any of .; at the end of the sentence
 				feat = feat[:-1] if feat[-1] in ['.', ';'] else feat
-				if any([w == wf for w in set(values) for wf in feat.lower().split()]):
-					if 'calyx' in feat.lower() and key != 'CalyxSize' or 'petiole' in feat.lower() and key != 'PetioleSize' or 'anther' in feat.lower() and key != 'AntherSize' or 'pedicel' in feat.lower() and key != 'PedicelSize':
-						continue
-					word_match = [w.lower() for w in feat.split() if w.lower() in set(values)][0]
+				matched_word = list(re.finditer( r'\b('+ '|'.join([w for w in set(values)]) + r')\b', feat.lower()))
+				if any(matched_word):
+				# if any([w == wf for w in set(values) for wf in feat.lower().split()]):
+					# TODO: Esclusa, cercare di riprodurla tramite ordine priorità se ancora necessaria
+					# if 'calyx' in feat.lower() and key != 'CalyxSize' or 'petiole' in feat.lower() and key != 'PetioleSize' or 'anther' in feat.lower() and key != 'AntherSize' or 'pedicel' in feat.lower() and key != 'PedicelSize':
+					# 	continue
 					"TODO: Caso up to 3m, petiole 2mm???"
-					word_match_position = np.where(np.array(feat.lower().split()) == word_match)[0][0]
-					if key != 'Stature' and word_match_position > measure_position:
-						continue # if not stature and measure appears before the word, skip
+					if key != 'Stature':
+						matched_word = [w for w in matched_word if w.span()[0] < measure.span()[0]]
+						if not any(matched_word):
+							continue # if not stature and measure appears before the word, skip
+					matched_word = sorted(matched_word, key=lambda word: word.span()[1] - measure.span()[0])[0]
+					# word_match_position = len(re.findall(r'\s+', feats[0][:matched_word.span()[0]]))
+
 					# Priorities: Stature > ...
-					if found=='Stature':
+					if found and found[0] == 'Stature':
 						continue
-					
-					if found=='SeedSize' and key=='FruitSize':
+					if found and found[0] == 'SeedSize' and key=='FruitSize':
 						continue # If a key word for seed size and e.g. "per fruit" are contained in the string: Place the values in seed size only
-					if found in ['StamenSize', 'AntherSize', 'StigmaSize', 'StyleSize', 'OvarySize'] and key in ['FlowerSize', 'PetalSize']:
+					if found and found[0] in ['StamenSize', 'AntherSize', 'StigmaSize', 'StyleSize', 'OvarySize'] and key in ['FlowerSize', 'PetalSize']:
 						continue # Place in stamen size, anther size, stygma size, style size, ovary size respectively, ignoring flower and petal size
-					if found=='InflorescenceSize' and key == 'FlowerSize':
+					if found and found[0] =='InflorescenceSize' and key == 'FlowerSize':
 						continue # if inflorencence was already found, skip flower (e.g., "flower stem" associated with inflorescence only)
-					if found == 'FruitSize' and not any([w in feat.lower() for w in ['achene', 'cypsela']]):
+					if found and found[0] == 'FruitSize' and not any([w in feat.lower() for w in ['achene', 'cypsela']]):
 						continue # word for fruit size is used, except cypsela or achene: Ignore other words and place in fruit size
 
-					if abs(word_match_position - measure_position) > wordmeasure_distance:
-						# print(key, '||', word_match, '||', measure.group(), '||', feat)
-						pass
+					# if abs(word_match_position - measure_position) > wordmeasure_distance:
+					# 	pass
+					this_distance = abs(matched_word.span()[1] - measure.span()[0])
+					# this_distance = abs(word_match_position - measure_position)
 					if found:
-						if (any([w.lower() in feat.lower() for w in ['achene', 'cypsela']]) and {key, found[0]} == {'FruitSize', 'SeedSize'}) or\
-							{key, found[0]} == {'StigmaSize', 'StyleSize'}:
+						if (any([w in feat.lower() for w in ['achene', 'cypsela']]) and {key, found[0]} == {'FruitSize', 'SeedSize'}) or\
+						   (any([w in feat.lower() for w in ['stigma-style']]) and {key, found[0]} == {'StigmaSize', 'StyleSize'}) or\
+						   (any([w in feat.lower() for w in ['floret']]) and {key, found[0]} == {'RayFloretsSize', 'DiskFloretSize'}):
 							pass
 							# print(f'OK>> Multiple features found ({found}, {key}) in "{feat}"')
 						else:
-							this_distance = abs(word_match_position - measure_position)
 							if this_distance > found[1]:
 								continue
 							else:
+								print(found, key, matched_word, measure)
 								features[found[0]].remove(found[2])
 							tmp.append(f'({i}) Multiple features found ({found[0]}, {key}) in "{feat}"')
 							anomalies.add(i)
-					found = (key, abs(word_match_position - measure_position), measure.group())
+					found = (key, this_distance, measure.group())
 					# print(key,[w.lower() for w in set(values)|set([key]) if w.lower() in feat.lower()], measure)
 					
 					if key in features:
