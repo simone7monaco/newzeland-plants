@@ -66,6 +66,12 @@ def main():
         processed_features_anom = processed_features[processed_features.index.isin(
             # processed_features.index.intersection(acceptances.keys()))
             acceptances.keys())]
+        
+        # search box to filter species
+        search = st.text_input("Search", value='', key='search')
+        if search != '':
+            processed_features_anom = processed_features_anom[processed_features_anom.index.str.contains(search, case=False)]
+        
         page_number = st.selectbox("Page number", range(0, len(processed_features_anom), page_length), index=0)
 
         processed_view = processed_features_anom.iloc[page_number:page_number+page_length]
