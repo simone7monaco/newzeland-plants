@@ -1,0 +1,1 @@
+python /home/smonaco/newzeland-plants/grape_nz/train_grape.py --epochs 2500 --cross_val
