@@ -15,7 +15,7 @@ acc_file = Path(__file__).parent / "acceptances.json"
 if not acc_file.exists():
     with open(acc_file, "w") as f:
         json.dump({}, f)
-        
+
 with open(acc_file) as f:
     acceptances = json.load(f)
 
@@ -85,6 +85,8 @@ def main():
         toggles = {}
         bar = st.progress(0)
         for i, (species_name, feature) in enumerate(processed_view.iterrows()):
+            if not species_name.startswith('Deparia petersenii subsp'):
+                continue
             bar.progress(i/len(processed_view))
             features_text = species.loc[species_name, 'Features'].replace('\xa0', ' ').replace('×', 'x').replace('–', '-')
             if features_text == '': continue
@@ -107,9 +109,9 @@ def main():
                                                 
             detected_features = []
             for match in measures_in_text:
-                print(match.group().replace(' ', '').replace('long', '-long').replace('wide', '-wide'))
+                # print(match.group().replace(' ', '').replace('long', '-long').replace('wide', '-wide'))
                 which_feature = feature[feature.apply(lambda x: isinstance(x, str) and string_preprocessing(
-                    match.group().replace(' ', '').replace('long', '-long').replace('wide', '-wide')
+                    match.group().replace(' ', '').replace('long', ' long').replace('wide', ' wide')
                                                                                                             ).strip() in x.split('; '))]
                 if which_feature.empty:
                     detected_features.append(('null', match.group(), match.start(), match.end()))

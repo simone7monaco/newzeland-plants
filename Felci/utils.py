@@ -20,6 +20,7 @@ extra_features = {k.title().replace(' ', ''): [x for x in v if str(x) != 'nan'] 
 unit = '[m|c|d|µ]?m'
 number = r"(\d+\.?\d*)"
 full_regex = rf"(({number}\s?-\s?)?{number})?({number}\s?-\s?)?{number}\s*{unit}\s(wide)?(long)?"
+full_regex = full_regex + r'(?=[\s\.,;])'
 
 
 def string_preprocessing(s):
@@ -75,12 +76,12 @@ def extract_features(i, feats:list):
 								# print(found, key, matched_word, measure)
 								features[found[0]].remove(found[2])
 							anomalies.add(i)
-					found = (key, this_distance, measure.group())
+					found = (key, this_distance, measure.group().strip())
 					
 					if key in features:
-						features[key].append(measure.group())
+						features[key].append(measure.group().strip())
 					else:
-						features[key] = [measure.group()]
+						features[key] = [measure.group().strip()]
 	return pd.Series(features)
 
 def get_unlabelled_measures(processed_features):
