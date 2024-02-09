@@ -11,7 +11,12 @@ processed_path = Path(__file__).parent / "Felci/processed_features_fern.csv"
 species = pd.read_excel(Path(__file__).parent / "Felci/fern_descriptions.xlsx").set_index('Species')
 species['Features'] = species.Etymology.fillna('') + ' ' + species['Vernacular name'].fillna('')
 
-with open(Path(__file__).parent / "acceptances.json") as f:
+acc_file = Path(__file__).parent / "acceptances.json"
+if not acc_file.exists():
+    with open(acc_file, "w") as f:
+        json.dump({}, f)
+        
+with open(acc_file) as f:
     acceptances = json.load(f)
 
 def refresh_processed_features():
