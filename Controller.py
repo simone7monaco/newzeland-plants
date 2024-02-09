@@ -4,19 +4,20 @@ import seaborn as sns
 import json
 
 from annotated_text import annotated_text
-from utils import *
+from Felci.utils import *
 import hmac
 
-processed_path = Path(__file__).parent / "processed_features.csv"
-species = pd.read_excel(Path(__file__).parent / "plant_info.xlsx").set_index('SpeciesName')
-species['Features'] = species['Features'].fillna('')
+processed_path = Path(__file__).parent / "Felci/processed_features_fern.csv"
+species = pd.read_excel(Path(__file__).parent / "Felci/fern_descriptions.xlsx").set_index('Species')
+species['Features'] = species.Etymology.fillna('') + ' ' + species['Vernacular name'].fillna('')
 
 with open(Path(__file__).parent / "acceptances.json") as f:
     acceptances = json.load(f)
 
 def refresh_processed_features():
-    processed_features = species.Features.apply(string_preprocessing).str.split(r'(?<!\sc)[.;]\s|;').reset_index().apply(lambda x: extract_features(x.SpeciesName, x.Features), axis=1)
-    processed_features = processed_features.applymap(lambda x: '; '.join(x) if not isinstance(x, float) else x)
+    # processed_features = species.Features.apply(string_preprocessing).str.split(r'(?<!\sc)[.;]\s|;').reset_index().apply(lambda x: extract_features(x.SpeciesName, x.Features), axis=1)
+    processed_features = species.Features.apply(string_preprocessing).str.split(r'\s\.').reset_index().apply(lambda x: extract_features(x.Species, x.Features), axis=1)
+    processed_features = processed_features.map(lambda x: '; '.join(x) if not isinstance(x, float) else x)
     processed_features.index = species.index
 
     processed_features.to_csv(processed_path)
@@ -96,11 +97,15 @@ def main():
             
             
 
-            measures_in_text = re.finditer(r'\d[\d\.\s\(\)x-]*[cmd]?m\s?(?![\d-\(\)])', features_text)
-            
+            # measures_in_text = re.finditer(r'\d[\d\.\s\(\)x-]*[cmd]?m\s?(?![\d-\(\)])( wide)?( long)?', features_text)
+            measures_in_text = re.finditer(fr'{number}\s?{unit}( wide)?( long)?', features_text)
+                                                
             detected_features = []
             for match in measures_in_text:
-                which_feature = feature[feature.apply(lambda x: isinstance(x, str) and string_preprocessing(match.group()).strip() in x.split('; '))]
+                print(match.group().replace(' ', '').replace('long', '-long').replace('wide', '-wide'))
+                which_feature = feature[feature.apply(lambda x: isinstance(x, str) and string_preprocessing(
+                    match.group().replace(' ', '').replace('long', '-long').replace('wide', '-wide')
+                                                                                                            ).strip() in x.split('; '))]
                 if which_feature.empty:
                     detected_features.append(('null', match.group(), match.start(), match.end()))
                 else:
