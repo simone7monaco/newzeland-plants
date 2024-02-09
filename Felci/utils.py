@@ -17,7 +17,7 @@ extra_features_df = extra_features_df[
 extra_features = extra_features_df.to_dict('list')
 extra_features = {k.title().replace(' ', ''): [x for x in v if str(x) != 'nan'] for k, v in extra_features.items()}
 
-unit = '[m|c|d|µ]?m'
+unit = '[m|c|d|µ]?m\s'
 number = r"(\d+\.?\d*)"
 full_regex = rf"(({number}\s?-\s?)?{number})?({number}\s?-\s?)?{number}\s*{unit}(-wide)?(-long)?"
 
