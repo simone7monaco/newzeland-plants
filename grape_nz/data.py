@@ -119,13 +119,18 @@ def load_data(args):
     # TODO: aggiungere feat. categoriche.Come vengono gestite nell'imputing?
     df_X = pd.read_csv('../processed_features_num.csv', index_col=0)
     df_X = df_X.drop(columns=[c for c in df_X.columns if c.endswith('_isabsent') or c.endswith('_w')])
-    cols_to_drop = df_X.isna().sum()[df_X.isna().sum() > args.feat_nathr*df_X.shape[0]].index
-    print(f'Columns to drop (thr: {args.feat_nathr}): {cols_to_drop}')
-    df_X = df_X.drop(columns=cols_to_drop)
+    if args.feat_nathr > 0:
+        cols_to_drop = df_X.isna().sum()[df_X.isna().sum() > args.feat_nathr*df_X.shape[0]].index
+        print(f'Columns to drop (thr: {args.feat_nathr}): {cols_to_drop}')
+        df_X = df_X.drop(columns=cols_to_drop)
 
     df_X = df_X.reset_index(drop=True)
     df_X_cat = df_X.Family
     df_X = df_X.drop(columns=['Family']).T.reset_index(drop=True).T
+
+    if args.quantile_todrop > 0:
+        q = df_X.quantile(args.quantile_todrop)
+        df_X[df_X > q] = np.nan
 
     data = get_data(df_X, df_X_cat, args=args)
     # args.split_sample := 0

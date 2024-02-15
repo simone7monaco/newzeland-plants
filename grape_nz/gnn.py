@@ -33,8 +33,7 @@ def train_gnn(data, args, log_path, device=torch.device('cpu')):
         model = torch.load(load_path+'model'+args.transfer_extra+'.pt',map_location=device)
         impute_model = torch.load(load_path+'impute_model'+args.transfer_extra+'.pt',map_location=device)
 
-    trainable_parameters = list(model.parameters()) \
-                           + list(impute_model.parameters())
+    trainable_parameters = list(model.parameters()) + list(impute_model.parameters())
     print("total trainable_parameters: ",len(trainable_parameters))
     # build optimizer
     scheduler, opt = build_optimizer(args, trainable_parameters)
