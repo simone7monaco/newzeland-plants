@@ -4,7 +4,7 @@ import seaborn as sns
 import json
 
 from annotated_text import annotated_text
-from Felci.utils import *
+from Felci._utils import *
 import hmac
 
 processed_path = Path(__file__).parent / "Felci/processed_features_fern.csv"
