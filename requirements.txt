@@ -1,4 +1,0 @@
-seaborn
-regex
-st-annotated-text
-openpyxl

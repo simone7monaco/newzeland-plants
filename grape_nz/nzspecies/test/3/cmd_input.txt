@@ -1,1 +1,0 @@
-python train_grape.py --ep 2500 --split 3 --cross_val

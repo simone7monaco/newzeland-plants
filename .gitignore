@@ -2,11 +2,5 @@
 **/__pycache__/*
 .vscode/
 accept*json
-Felci/descriptions/*
-grape_nz/nzspecies/soft_del
-graph_dataset/
-*csv
-Felci/*csv
-Felci/*xlsx
-Felci/Flora of Australia ferns.pdf
-*nex
+legacy/*
+data/Ferns

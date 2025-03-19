@@ -1,1 +1,0 @@
-python /home/smonaco/newzeland-plants/grape_nz/train_grape.py --cross_val
