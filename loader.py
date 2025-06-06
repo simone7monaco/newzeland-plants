@@ -8,9 +8,10 @@ from Bio import Phylo
 import networkx as nx
 from node2vec import Node2Vec
 from sklearn.cluster import SpectralClustering
+from sklearn.model_selection import GroupKFold, KFold
 
 import torch
-from torch_geometric.data import Data
+from torch_geometric.data import Data, HeteroData
 from torch_geometric.transforms import KNNGraph, BaseTransform
 from torch_geometric.utils import from_networkx
 from torch_geometric.data import InMemoryDataset
@@ -19,32 +20,125 @@ from torch_geometric.utils import subgraph, bipartite_subgraph
 
 class NormalizeFeatures(BaseTransform):
     r"""Row-normalizes the attributes using min-max scaling."""
-    def __init__(self, attrs=None):
-        self.attrs = attrs or ['x_species', 'x_species_phylo', 'x_spatial', 'global_data', 
-                               'edge_attr_species', 'edge_attr_spatial', 'bip_edge_attr']
-        self.min_max = {}
+    def __init__(self, normalizations=None):
+        # self.normalizations = normalizations or {
+        #     'spatial/x': 'sincos', # They are latitude and longitude
+        #     'spatial/global_data': 'z',
+        #     'species/x': 'logz', # always positive and sometimes skewed
+        #     'species/y': 'logz', 
+        #     'species/x_phylo': None, # x_phylo is a vector of embeddings, so no normalization
+        #     'spatial-spatial/edge_attr': 'logz',
+        #     'species-species/edge_attr': 'z',
+        #     'spatial-species/edge_attr': 'z',
+        # }
+        self.normalizations = normalizations or {
+            'spatial_x': 'sincos', # They are latitude and longitude
+            'spatial_global_data': 'z',
+            'species_x': 'logz', # always positive and sometimes skewed
+            'species_y': 'logz', 
+            'species_x_phylo': None, # x_phylo is a vector of embeddings, so no normalization
+            'spatial_spatial_edge_attr': 'logz',
+            'species_species_edge_attr': 'z',
+            'spatial_species_edge_attr': 'z',
+        }
+        self.props = {}
 
-    def forward(self, data):
-        assert all(attr in data for attr in self.attrs), 'Not all attributes are present in the data.'
-        for attr in self.attrs:
-            if attr not in self.min_max:
-                self.min_max[attr] = (data[attr].min(dim=0)[0], data[attr].max(dim=0)[0])
-            min_val, max_val = self.min_max[attr]
-            data[attr] = (data[attr] - min_val) / (max_val - min_val)
+    def forward(self, data: Data):
+        for k_norm in self.normalizations:
+            if self.normalizations[k_norm] == 'sincos':
+                data[k_norm] = data[k_norm] * np.pi / 180
+                data[k_norm] = torch.stack([torch.sin(data[k_norm][:, 0]), torch.cos(data[k_norm][:, 0]),
+                                          torch.sin(data[k_norm][:, 1]), torch.cos(data[k_norm][:, 1])], dim=1)
+            elif self.normalizations[k_norm] in ['logz', 'z']:
+                # log normalization and/or z normalization
+                if self.normalizations[k_norm] == 'logz':
+                    data[k_norm] = torch.log(data[k_norm] + 1e-6)
+                mean = data[k_norm].mean(dim=0)
+                std = data[k_norm].std(dim=0)
+                data[k_norm] = (data[k_norm] - mean) / std
+                self.props[k_norm] = {'mean': mean, 'std': std}
+            elif self.normalizations[k_norm] is None:
+                pass
+            else:
+                raise ValueError(f"Unknown normalization: {self.normalizations[k_norm]}")
         return data
     
     def inverse(self, data):
-        for attr in self.attrs:
-            if attr in data:
-                min_val, max_val = self.min_max[attr]
-                data[attr] = data[attr] * (max_val - min_val) + min_val
+        data = data.clone()
+        for k_norm in self.normalizations:
+            if self.normalizations[k_norm] == 'sincos':
+                lat = torch.atan2(data[k_norm][:, 0], data[k_norm][:, 1]) * 180 / np.pi
+                lon = torch.atan2(data[k_norm][:, 2], data[k_norm][:, 3]) * 180 / np.pi
+                data[k_norm] = torch.stack([lat, lon], dim=1)
+            elif self.normalizations[k_norm] in ['logz', 'z']:
+                # log normalization and/or z normalization
+                data[k_norm] = data[k_norm] * self.props[k_norm]['std'] + self.props[k_norm]['mean']
+                if self.normalizations[k_norm] == 'logz':
+                    data[k_norm] = torch.exp(data[k_norm]) - 1e-6
         return data
+    
+    # def forward(self, data: HeteroData):
+    #     for k_norm in self.normalizations:
+    #         n, k = k_norm.split('/')
+    #         if len(n.split('-')) > 1:
+    #             n = tuple(n.split('-'))
+            
+    #         if self.normalizations[k_norm] == 'sincos':
+    #             data[n][k] = data[n][k] * np.pi / 180
+    #             data[n][k] = torch.stack([torch.sin(data[n][k][:, 0]), torch.cos(data[n][k][:, 0]),
+    #                                       torch.sin(data[n][k][:, 1]), torch.cos(data[n][k][:, 1])], dim=1)
+    #         elif self.normalizations[k_norm] in ['logz', 'z']:
+    #             # log normalization and/or z normalization
+    #             if self.normalizations[k_norm] == 'logz':
+    #                 data[n][k] = torch.log(data[n][k] + 1e-6)
+    #             mean = data[n][k].mean(dim=0)
+    #             std = data[n][k].std(dim=0)
+    #             data[n][k] = (data[n][k] - mean) / std
+    #             self.props[k_norm] = {'mean': mean, 'std': std}
+    #         elif self.normalizations[k_norm] is None:
+    #             pass
+    #         else:
+    #             raise ValueError(f"Unknown normalization: {self.normalizations[k_norm]}")
+    #     return data
+    
+    # def inverse(self, data, warn=True):
+    #     data = data.clone()
+    #     for k_norm in self.normalizations:
+    #         n, k = k_norm.split('/')
+    #         if len(n.split('-')) > 1:
+    #             n = tuple(n.split('-'))
+            
+    #         if n not in (data.node_types + data.edge_types) or k not in data[n].keys():
+    #             if warn:
+    #                 print(f"Warning: {n} or {n}/{k} not in data")
+    #             continue
+    #         if self.normalizations[k_norm] == 'sincos':
+    #             lat = torch.atan2(data[n][k][:, 0], data[n][k][:, 1]) * 180 / np.pi
+    #             lon = torch.atan2(data[n][k][:, 2], data[n][k][:, 3]) * 180 / np.pi
+    #             data[n][k] = torch.stack([lat, lon], dim=1)
+    #         elif self.normalizations[k_norm] in ['logz', 'z']:
+    #             # log normalization and/or z normalization
+    #             data[n][k] = data[n][k] * self.props[k_norm]['std'] + self.props[k_norm]['mean']
+    #             if self.normalizations[k_norm] == 'logz':
+    #                 data[n][k] = torch.exp(data[n][k]) - 1e-6
+    #     return data
+    
+
+class NZData(Data):
+    def __inc__(self, key, value, *args, **kwargs):
+        if key == 'species_species_edge_index':
+            return self.species_num_nodes
+        elif key == 'spatial_spatial_edge_index':
+            return self.spatial_num_nodes
+        elif key == 'spatial_species_edge_index':
+            return torch.tensor([[self.spatial_num_nodes], [self.species_num_nodes]])
+        return super().__inc__(key, value, *args, **kwargs)
 
 
 class FernDataset(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None, pre_filter=None):
         self.traits_all = self.traits_df(root)
-        self.y_index = np.arange(len(self.traits_all.columns))[[not (c.startswith('Habitat') or c.startswith('Family')) for c in self.traits_all.columns]]
+        self.y_index = np.arange(len(self.traits_all.columns))[[not (c.startswith('Habitat') or c.startswith('Family') or c.startswith('Hybridisation')) for c in self.traits_all.columns]]
 
         super().__init__(root, transform, pre_transform, pre_filter)
         self.load(self.processed_paths[0])
@@ -83,7 +177,7 @@ class FernDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return ['data.pt']
+        return ['heterodata.pt']
 
     def download(self):
         raise RuntimeError('Dataset not found.')
@@ -112,7 +206,6 @@ class FernDataset(InMemoryDataset):
     def get_species_graph(self):
         tree_file = self.root/"grafted_tree.nwk"
         tree = Phylo.read(tree_file, "newick")
-        # Phylo.draw_ascii(tree)
 
         G = nx.Graph()
         for clade in tree.get_nonterminals():  # Internal nodes (non-leaf)
@@ -213,69 +306,122 @@ class FernDataset(InMemoryDataset):
         bip_edge_index = torch.tensor(index_space_specie[['cluster', 'species_idx']].values.T, dtype=torch.long)
         bip_edge_attr = torch.tensor(index_space_specie.occurrence.values, dtype=torch.float32).unsqueeze(1)
 
-        data_all = Data(
-            x_species=species_graph.traits,
-            x_species_phylo=species_graph.x,
-            x_species_traits_nanmask=species_graph.traits_nanmask[:, self.y_index],
-            x_spatial=spatial_graph.pos,
-            species_names=species_graph.node_names,
-            edge_index_species=species_graph.edge_index,
-            edge_index_spatial=spatial_graph.edge_index,
-            edge_attr_species=species_graph.weight,
-            edge_attr_spatial=spatial_graph.edge_attr,
-            bip_edge_index=bip_edge_index,
-            bip_edge_attr=bip_edge_attr,
-            global_data=torch.tensor(self.global_data.values, dtype=torch.float32),
-            num_nodes=species_graph.num_nodes,
+        data_all = NZData(
+        species_x=species_graph.traits,
+        species_names=species_graph.node_names,
+        species_x_phylo=species_graph.x,
+        traits_nanmask=species_graph.traits_nanmask[:, self.y_index],
+        spatial_x=spatial_graph.pos,
+        spatial_pos=spatial_graph.pos, # repeated to stay un-normalized
+        spatial_global_data=torch.tensor(self.global_data.values, dtype=torch.float32),
+        species_species_edge_index=species_graph.edge_index,
+        species_species_edge_attr=species_graph.weight,
+        spatial_spatial_edge_index=spatial_graph.edge_index,
+        spatial_spatial_edge_attr=spatial_graph.edge_attr,
+        spatial_species_edge_index=bip_edge_index,
+        spatial_species_edge_attr=bip_edge_attr,
+        species_num_nodes=species_graph.num_nodes,
+        spatial_num_nodes=spatial_graph.num_nodes,
         )
+        data_all['species_y'] = species_graph.traits[:, self.y_index]*~data_all.traits_nanmask
+
+
+        # data_all = HeteroData()
+        # data_all.species_x = species_graph.traits
+        # data_all['species'].names = species_graph.node_names
+        # data_all.species_x_phylo = species_graph.x
+        # data_all['species'].traits_nanmask = species_graph.traits_nanmask[:, self.y_index]
+        # data_all['species'].names = species_graph.node_names
+        # data_all['species'].y = species_graph.traits[:, self.y_index]*~data_all['species'].traits_nanmask
+        # data_all.spatial_x = spatial_graph.pos
+        # data_all.spatial_pos = spatial_graph.pos # repeated to stay un-normalized
+        # data_all.spatial_global_data = torch.tensor(self.global_data.values, dtype=torch.float32)
+        # data_all['species', 'connects_to', 'species'].edge_index = species_graph.edge_index
+        # data_all['species', 'connects_to', 'species'].edge_attr = species_graph.weight
+        # data_all['spatial', 'connects_to', 'spatial'].edge_index = spatial_graph.edge_index
+        # data_all['spatial', 'connects_to', 'spatial'].edge_attr = spatial_graph.edge_attr
+        # data_all['spatial', 'contains', 'species'].edge_index = bip_edge_index
+        # data_all['spatial', 'contains', 'species'].edge_attr = bip_edge_attr
         self.save([data_all], self.processed_paths[0])
     
     def __getitem__(self, idx):
         data = super().__getitem__(idx)
-        data.y = data.x_species[:, self.y_index]*~data.x_species_traits_nanmask
+        # data.y = data.x_species[:, self.y_index]*~data.x_species_traits_nanmask
         return data
+        
 
-
-def data_split(data, test_size=0.3, k=0):
+def data_split(data, test_size=0.3, k=0, seed=42):
     G = nx.Graph()
-    G.add_nodes_from(range(data.num_nodes))
-    G.add_edges_from(data.edge_index_species.T.numpy())
+    G.add_nodes_from(range(data.species_num_nodes))
+    # G.add_edges_from(data.edge_index_species.T.numpy())
+    G.add_edges_from(data.species_species_edge_index.T.numpy())
     communities = list(nx.algorithms.community.louvain_communities(G))
 
-    # Flatten communities into node indices
-    node_community = [np.argmax([node in comm for comm in communities]) for node in G.nodes()]
+    cs = []
+    for i, community in enumerate(communities):
+        cs.extend(((node, i) for node in community))
 
-    from sklearn.model_selection import GroupShuffleSplit
+    cs = pd.DataFrame(cs, columns=['species_idx', 'community'])
+    cs.loc[cs.community.groupby(cs.community).transform('size').eq(1), 'community'] = cs.community.max() + 1
 
-    splitter = GroupShuffleSplit(test_size=test_size, random_state=42, n_splits=3)
-    splits = [s for s in splitter.split(G.nodes(), groups=node_community)]
+    # split the bigger communities into smaller ones (if they are bigger than 1/5 of the dataset, slit by tiles of 1/5 of the community size)
+    for i, community in cs.groupby('community'):
+        if len(community) > len(cs) / 5:
+            cs.loc[community.index, 'community'] = (community.species_idx // (len(community) // 5)).astype(int) + cs.community.max() + 1
+
+    splitter = KFold(n_splits=5, random_state=seed, shuffle=True)
+    splits = [s for s in splitter.split(G.nodes())]
+    #splits = [s for s in splitter.split(G.nodes(), groups=cs.community)]
     train_nodes, test_nodes = splits[k]
 
-    train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-    test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+    train_mask = torch.zeros(data.species_num_nodes, dtype=torch.bool)
+    test_mask = torch.zeros(data.species_num_nodes, dtype=torch.bool)
 
     train_mask[train_nodes] = True
     test_mask[test_nodes] = True
 
     if train_mask.sum() < test_mask.sum():
-        print(f'Warning: Swapped train and test masks ({train_mask.sum()} < {test_mask.sum()})')
+        # print(f'Warning: Swapped train and test masks ({train_mask.sum()} < {test_mask.sum()})')
         train_mask, test_mask = test_mask, train_mask
     data.train_mask = train_mask
     data.test_mask = test_mask
 
     train_data = data.clone()
     test_data = data.clone()
-    for attr in ['x_species', 'y', 'x_species_phylo', 'x_species_traits_nanmask']:
-        train_data[attr] = train_data[attr][train_mask]
-        test_data[attr] = test_data[attr][test_mask]
+    for attr in ['x', 'y', 'x_phylo',]:
+        train_data[f'species_{attr}'] = train_data[f'species_{attr}'][train_mask]
+        test_data[f'species_{attr}'] = test_data[f'species_{attr}'][test_mask]
+    train_data.traits_nanmask = train_data.traits_nanmask[train_mask]
+    test_data.traits_nanmask = test_data.traits_nanmask[test_mask]
+    train_data.species_num_nodes = train_mask.sum().item()
+    test_data.species_num_nodes = test_mask.sum().item()
+    
 
     for data_split, mask in zip([train_data, test_data], [train_mask, test_mask]):
-        data_split.edge_index_species, data_split.edge_attr_species = subgraph(mask, data.edge_index_species, data.edge_attr_species, relabel_nodes=True)
-        data_split.bip_edge_index, data_split.bip_edge_attr = bipartite_subgraph((torch.ones(data.x_spatial.size(0), dtype=torch.bool), mask), 
-                                                                                data.bip_edge_index, data.bip_edge_attr, relabel_nodes=True)
+        data_split.species_species_edge_index, data_split.species_species_edge_attr = subgraph(
+            mask, edge_index=data.species_species_edge_index,
+            edge_attr=data.species_species_edge_attr,
+            relabel_nodes=True
+            )
+        data_split.spatial_species_edge_index, data_split.spatial_species_edge_attr = bipartite_subgraph(
+            (torch.ones(data.spatial_num_nodes, dtype=torch.bool), mask), 
+            edge_index=data.spatial_species_edge_index, edge_attr=data.spatial_species_edge_attr, relabel_nodes=True
+            )
     return train_data, test_data
 
 if __name__ == '__main__':
     norm_transform = NormalizeFeatures()
-    dataset = FernDataset(Path('data/Ferns'), transform=norm_transform)
-    print(dataset)
+    data = FernDataset(Path('data/Ferns'))[0]
+    normed_data = norm_transform(data)
+    re_unnormed_data = norm_transform.inverse(normed_data)
+
+    for k in norm_transform.normalizations:
+        if not torch.allclose(data[k], re_unnormed_data[k]):
+            print(f"Normalization failed for {k} (max diff: {torch.max(torch.abs(data[k] - re_unnormed_data[k]))})")
+        # n, k = k.split('/')
+        # if len(n.split('-')) > 1:
+        #     n = n.split('-')
+        # if not torch.allclose(data[n][k], re_unnormed_data[n][k]):
+        #     print(f"Normalization failed for {n}: {k} (max diff: {torch.max(torch.abs(data[n][k] - re_unnormed_data[n][k]))})")
+
+    

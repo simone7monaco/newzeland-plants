@@ -4,3 +4,4 @@
 accept*json
 legacy/*
 data/Ferns
+*pth
