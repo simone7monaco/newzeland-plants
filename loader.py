@@ -6,7 +6,6 @@ import itertools
 import pandas as pd
 from Bio import Phylo
 import networkx as nx
-from node2vec import Node2Vec
 from sklearn.cluster import SpectralClustering
 from sklearn.model_selection import GroupKFold, KFold
 
@@ -216,6 +215,7 @@ class FernDataset(InMemoryDataset):
                     child.name = f"temp_{id(child)}"
                 G.add_edge(clade.name, child.name, weight=child.branch_length)
         
+        from node2vec import Node2Vec
         node2vec = Node2Vec(G, dimensions=16, walk_length=30, num_walks=200, workers=4)
         model = node2vec.fit(window=10, min_count=1, batch_words=4)
 
