@@ -5,3 +5,5 @@ accept*json
 legacy/*
 data/Ferns
 *pth
+*png
+attributions_*csv
