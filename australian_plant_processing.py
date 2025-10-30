@@ -8,8 +8,6 @@ plants = pd.read_excel("data/Australian layers/AusTraits.xlsx")
 plant_names = plants.species.str.replace("_", " ")
 from huggingface_hub import login
 
-os.environ['HF_TOKEN'] = 'REDACTED_HF_TOKEN'
-
 
 PROMPT = """
 TASK
