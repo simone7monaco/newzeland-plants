@@ -20,16 +20,6 @@ from torch_geometric.utils import subgraph, bipartite_subgraph
 class NormalizeFeatures(BaseTransform):
     r"""Row-normalizes the attributes using min-max scaling."""
     def __init__(self, normalizations=None):
-        # self.normalizations = normalizations or {
-        #     'spatial/x': 'sincos', # They are latitude and longitude
-        #     'spatial/global_data': 'z',
-        #     'species/x': 'logz', # always positive and sometimes skewed
-        #     'species/y': 'logz', 
-        #     'species/x_phylo': None, # x_phylo is a vector of embeddings, so no normalization
-        #     'spatial-spatial/edge_attr': 'logz',
-        #     'species-species/edge_attr': 'z',
-        #     'spatial-species/edge_attr': 'z',
-        # }
         self.normalizations = normalizations or {
             'spatial_x': 'sincos', # They are latitude and longitude
             'spatial_global_data': 'z',
@@ -62,9 +52,13 @@ class NormalizeFeatures(BaseTransform):
                 raise ValueError(f"Unknown normalization: {self.normalizations[k_norm]}")
         return data
     
-    def inverse(self, data):
+    def inverse(self, data, warn=True):
         data = data.clone()
         for k_norm in self.normalizations:
+            if k_norm not in data.keys():
+                if warn:
+                    print(f"Warning: {k_norm} not in data")
+                continue
             if self.normalizations[k_norm] == 'sincos':
                 lat = torch.atan2(data[k_norm][:, 0], data[k_norm][:, 1]) * 180 / np.pi
                 lon = torch.atan2(data[k_norm][:, 2], data[k_norm][:, 3]) * 180 / np.pi
@@ -75,52 +69,6 @@ class NormalizeFeatures(BaseTransform):
                 if self.normalizations[k_norm] == 'logz':
                     data[k_norm] = torch.exp(data[k_norm]) - 1e-6
         return data
-    
-    # def forward(self, data: HeteroData):
-    #     for k_norm in self.normalizations:
-    #         n, k = k_norm.split('/')
-    #         if len(n.split('-')) > 1:
-    #             n = tuple(n.split('-'))
-            
-    #         if self.normalizations[k_norm] == 'sincos':
-    #             data[n][k] = data[n][k] * np.pi / 180
-    #             data[n][k] = torch.stack([torch.sin(data[n][k][:, 0]), torch.cos(data[n][k][:, 0]),
-    #                                       torch.sin(data[n][k][:, 1]), torch.cos(data[n][k][:, 1])], dim=1)
-    #         elif self.normalizations[k_norm] in ['logz', 'z']:
-    #             # log normalization and/or z normalization
-    #             if self.normalizations[k_norm] == 'logz':
-    #                 data[n][k] = torch.log(data[n][k] + 1e-6)
-    #             mean = data[n][k].mean(dim=0)
-    #             std = data[n][k].std(dim=0)
-    #             data[n][k] = (data[n][k] - mean) / std
-    #             self.props[k_norm] = {'mean': mean, 'std': std}
-    #         elif self.normalizations[k_norm] is None:
-    #             pass
-    #         else:
-    #             raise ValueError(f"Unknown normalization: {self.normalizations[k_norm]}")
-    #     return data
-    
-    # def inverse(self, data, warn=True):
-    #     data = data.clone()
-    #     for k_norm in self.normalizations:
-    #         n, k = k_norm.split('/')
-    #         if len(n.split('-')) > 1:
-    #             n = tuple(n.split('-'))
-            
-    #         if n not in (data.node_types + data.edge_types) or k not in data[n].keys():
-    #             if warn:
-    #                 print(f"Warning: {n} or {n}/{k} not in data")
-    #             continue
-    #         if self.normalizations[k_norm] == 'sincos':
-    #             lat = torch.atan2(data[n][k][:, 0], data[n][k][:, 1]) * 180 / np.pi
-    #             lon = torch.atan2(data[n][k][:, 2], data[n][k][:, 3]) * 180 / np.pi
-    #             data[n][k] = torch.stack([lat, lon], dim=1)
-    #         elif self.normalizations[k_norm] in ['logz', 'z']:
-    #             # log normalization and/or z normalization
-    #             data[n][k] = data[n][k] * self.props[k_norm]['std'] + self.props[k_norm]['mean']
-    #             if self.normalizations[k_norm] == 'logz':
-    #                 data[n][k] = torch.exp(data[n][k]) - 1e-6
-    #     return data
     
 
 class NZData(Data):
@@ -271,7 +219,6 @@ class FernDataset(InMemoryDataset):
     def get_distribution(self, dist_path):
         ar = self.load_raster(dist_path)
 
-        # give a label to any non zero and non nan value and then aggregate on this dimension
         ar = ar.where(ar > 0, 0)
         ar = ar.where(ar.isnull(), 1)
 
