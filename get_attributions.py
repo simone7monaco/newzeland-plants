@@ -1,6 +1,6 @@
 import pytorch_lightning as pl
 from models import TraitsPredictor
-from loader import FernDataset, NormalizeFeatures, data_split, NZData
+from loader import PlantDataset, NormalizeFeatures, data_split, NZData
 from pathlib import Path
 import torch
 import numpy as np
@@ -25,7 +25,7 @@ seed = 42
 pl.seed_everything(seed)
 torch.cuda.manual_seed(seed)
 norm_transform = NormalizeFeatures()
-dataset = FernDataset(Path('data/Ferns'), transform=norm_transform)
+dataset = PlantDataset(Path('data/Ferns'), transform=norm_transform)
 
 space_cols = ['lon_1', 'lon_2', 'lat_1', 'lat_2'] +\
              dataset.load_complete('climatic layers').columns.tolist() + \
