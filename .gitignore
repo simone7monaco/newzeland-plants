@@ -10,4 +10,5 @@ attributions_*csv
 australian_imgs/
 data/
 guido
-
+wandb
+results
