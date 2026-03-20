@@ -45,23 +45,50 @@ def compute_reconstruction_mask(species_mean_df, observed_mask_df, mask_ratio=0.
 
     return reconstruction
 
-def compute_correlation(treats_pred, treats_true):
-    """Compute Pearson correlation coefficient between predicted and true traits."""
+def compute_correlation(treats_pred, treats_true, mode='per_feature_mean'):
+    """Compute Pearson correlation between predicted and true traits.
+
+    Args:
+        treats_pred, treats_true: arrays or torch tensors with shape (N, D).
+        mode: 'per_feature_mean' (default) computes Pearson per feature and returns the mean
+              'global' computes a single Pearson over all valid entries.
+
+    Returns:
+        float: correlation (nan if not computable)
+    """
     if isinstance(treats_pred, torch.Tensor):
         treats_pred = treats_pred.cpu().numpy()
     if isinstance(treats_true, torch.Tensor):
         treats_true = treats_true.cpu().numpy()
-    _, n_traits = treats_pred.shape
 
+    # mask positions where either pred or true is NaN
+    valid_mask = ~np.isnan(treats_true) & ~np.isnan(treats_pred)
+
+    if mode == 'global':
+        flat_mask = valid_mask.ravel()
+        if np.sum(flat_mask) < 2:
+            return np.nan
+        a = treats_pred.ravel()[flat_mask]
+        b = treats_true.ravel()[flat_mask]
+        # guard against zero-variance
+        if np.nanstd(a) == 0 or np.nanstd(b) == 0:
+            return np.nan
+        return np.corrcoef(a, b)[0, 1]
+
+    # default: per-feature mean
+    _, n_traits = treats_pred.shape
     corrs = []
     for j in range(n_traits):
-        pred_col = treats_pred[:, j]
-        true_col = treats_true[:, j]
-        mask = ~np.isnan(true_col)
+        mask = valid_mask[:, j]
         if np.sum(mask) < 2:
             corrs.append(np.nan)
             continue
-        corr = np.corrcoef(pred_col[mask], true_col[mask])[0, 1]
+        a = treats_pred[mask, j]
+        b = treats_true[mask, j]
+        if np.nanstd(a) == 0 or np.nanstd(b) == 0:
+            corrs.append(np.nan)
+            continue
+        corr = np.corrcoef(a, b)[0, 1]
         corrs.append(corr)
     return np.nanmean(corrs)
 

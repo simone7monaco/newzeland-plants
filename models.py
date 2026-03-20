@@ -8,6 +8,7 @@ from loader import data_split
 from torch_geometric.utils import subgraph, bipartite_subgraph
 from torch_geometric.data import HeteroData
 import torch_geometric
+from torch_geometric import nn as pyg_nn
 
 
 class GNN(nn.Module):
@@ -16,12 +17,14 @@ class GNN(nn.Module):
                  check_oversmoothing=True,
                  **kwargs):
         super(GNN, self).__init__()
-        if gnn in [torch_geometric.nn.GATConv, torch_geometric.nn.GATv2Conv, torch_geometric.nn.TransformerConv]:
+        if gnn in [pyg_nn.GATConv, pyg_nn.GATv2Conv, pyg_nn.TransformerConv]:
             kwargs['dropout'] = dropout
+            kwargs['heads'] = kwargs.get('heads', 4)
+            kwargs['concat'] = kwargs.get('concat', False) 
         self.convs = nn.ModuleList([gnn(in_channels, hidden_channels, edge_dim=edge_dim, **kwargs)])
         for _ in range(num_layers - 2):
             self.convs.append(gnn(hidden_channels, hidden_channels, edge_dim=edge_dim, **kwargs))
-        self.convs.append(gnn(hidden_channels, out_channels, edge_dim=edge_dim))
+        self.convs.append(gnn(hidden_channels, out_channels, edge_dim=edge_dim, **kwargs))
         self.check_oversmoothing = check_oversmoothing
         self.dirichlet_energy = []
 
@@ -61,17 +64,17 @@ class TraitsPredictor(nn.Module):
                  num_layers, dropout=0.3, gnn_module='GATConv', eps=1e-6, mask_ratio=0.15, 
                  mask_strategy='random', use_env_features=True):
         super(TraitsPredictor, self).__init__()
-        gnn = getattr(torch_geometric.nn, gnn_module)
+        gnn = getattr(pyg_nn, gnn_module)
 
         if use_env_features:
             pos_embedding_dim = 4 # sin-cos embeddings for latitude and longitude
             self.space_gnn = GNN(in_space+pos_embedding_dim, hidden_channels, hidden_channels, num_layers=num_layers, gnn=gnn, dropout=dropout)
             
             # Species-side: considering using only non-target  inputs at that stage
-            self.bipartite_conv = GATConv((hidden_channels, in_gen + in_phylo), hidden_channels, edge_dim=1, add_self_loops=False)
+            self.bipartite_conv = pyg_nn.GATConv((hidden_channels, in_gen + in_phylo), hidden_channels, edge_dim=1, add_self_loops=False)
 
-        # mean_traits, std_traits, gen_features, phylo_features
-        self.species_linear = nn.Linear(2*in_traits + in_gen + in_phylo, hidden_channels)
+        # mean_traits, std_traits, visibility_mask, gen_features, phylo_features
+        self.species_linear = nn.Linear(3*in_traits + in_gen + in_phylo, hidden_channels)
         self.species_gnn = GNN(hidden_channels + hidden_channels, hidden_channels, hidden_channels, num_layers=num_layers, gnn=gnn, dropout=dropout)
         
         # Predict mean and log_std separately (2 * out_channels)
@@ -139,8 +142,12 @@ class TraitsPredictor(nn.Module):
             # Zero out masked entries in the input (sentinel value)
             species_x_mean = species_x_mean * ~reconstruction_mask
             species_x_std = species_x_std * ~reconstruction_mask
+            # Binary indicator: 1 where the model can see the true value, 0 where missing or masked
+            visibility_mask = (observed_mask & ~reconstruction_mask).float()
+        else:
+            visibility_mask = observed_mask.float()
         
-        species_input = torch.cat([species_x_mean, species_x_std, data.species_x_gen, data.species_x_phylo], dim=1)
+        species_input = torch.cat([species_x_mean, species_x_std, visibility_mask, data.species_x_gen, data.species_x_phylo], dim=1)
         species_input = self.species_linear(species_input).relu()
         
         if self.use_env_features:
@@ -162,6 +169,7 @@ class TraitsPredictor(nn.Module):
                 space_to_species, bip_attention_weights = space_to_species
                 self.bip_attention_weights = bip_attention_weights
             space_to_species = space_to_species.relu()
+            # space_to_species = torch.zeros_like(space_to_species)
 
             species_input = torch.cat([space_to_species, species_input], dim=1)
 
@@ -326,13 +334,13 @@ class MixedNLLLoss(nn.Module):
                 target_mean[point_mask],
                 reduction="sum",
             )
-            loss_sum = loss_sum + huber * point_mask.sum()
+            loss_sum = loss_sum + huber #* point_mask.sum()
 
         # ---- Distribution targets: KL divergence ----
         if dist_mask.any():
             # Clamp predicted std away from 0 for numerical stability in KL.
             # (We do NOT use pred_std for point targets; only for dist targets.)
-            if dist == "normal":
+            if self.distribution == "normal":
                 mu_p = pred_mean[dist_mask]
                 sig_p = pred_std[dist_mask].clamp_min(self.eps)
 
@@ -354,7 +362,10 @@ class MixedNLLLoss(nn.Module):
 
             # KL( N(mu_t, sig_t^2) || N(mu_p, sig_p^2) )
             kl = torch.log(sig_p / sig_t) + (sig_t.pow(2) + (mu_t - mu_p).pow(2)) / (2.0 * sig_p.pow(2)) - 0.5
-            loss_sum = loss_sum + self.kl_weight * kl.sum() * dist_mask.sum()
+            # KL( N(mu_p, sig_p^2) || N(mu_t, sig_t^2) )
+            # kl = torch.log(sig_t / sig_p) + (sig_p.pow(2) + (mu_p - mu_t).pow(2)) / (2.0 * sig_t.pow(2)) - 0.5
+
+            loss_sum = loss_sum + self.kl_weight * kl.sum() #* dist_mask.sum()
 
         self.cache = {
             'huber': huber.mean().item() if point_mask.any() else 0.0,
@@ -410,48 +421,48 @@ def graph_smoothness_loss(pred_mean, edge_index, nanmask=None, reduction='mean')
         return smoothness
 
 
-class FernModel(pl.LightningModule):
-    def __init__(self, data, lr=0.01):
-        super(FernModel, self).__init__()
-        self.model = TraitsPredictor(in_traits=data.x_species.size(1), in_phylo=data.x_species_phylo.size(1), 
-                        in_space=data.global_data.size(1), hidden_channels=16, out_channels=data.y.size(1),
-                        num_layers=2)
-        self.data = data
-        self.lr = lr
+# class FernModel(pl.LightningModule):
+#     def __init__(self, data, lr=0.01):
+#         super(FernModel, self).__init__()
+#         self.model = TraitsPredictor(in_traits=data.x_species.size(1), in_phylo=data.x_species_phylo.size(1), 
+#                         in_space=data.global_data.size(1), hidden_channels=16, out_channels=data.y.size(1),
+#                         num_layers=2)
+#         self.data = data
+#         self.lr = lr
 
-    def setup(self, stage):
-        self.data = data_split(self.data)
+#     def setup(self, stage):
+#         self.data = data_split(self.data)
 
-        self.train_data = self.data.clone()
-        self.test_data = self.data.clone()
-        for attr in ['x_species', 'y', 'x_species_phylo', 'x_species_traits_nanmask']:
-            self.train_data[attr] = self.train_data[attr][self.data.train_mask]
-            self.test_data[attr] = self.test_data[attr][self.data.test_mask]
+#         self.train_data = self.data.clone()
+#         self.test_data = self.data.clone()
+#         for attr in ['x_species', 'y', 'x_species_phylo', 'x_species_traits_nanmask']:
+#             self.train_data[attr] = self.train_data[attr][self.data.train_mask]
+#             self.test_data[attr] = self.test_data[attr][self.data.test_mask]
 
-        for ds, mask in zip([self.train_data, self.test_data], [self.data.train_mask, self.data.test_mask]):
-            ds.edge_index_species, ds.edge_attr_species = subgraph(mask, self.data.edge_index_species, self.data.edge_attr_species, relabel_nodes=True)
-            ds.bip_edge_index, ds.bip_edge_attr = bipartite_subgraph((torch.ones(self.data.x_spatial.size(0), dtype=torch.bool, device=self.data.x_spatial.device), mask), 
-                                                                                    self.data.bip_edge_index, self.data.bip_edge_attr, relabel_nodes=True)
+#         for ds, mask in zip([self.train_data, self.test_data], [self.data.train_mask, self.data.test_mask]):
+#             ds.edge_index_species, ds.edge_attr_species = subgraph(mask, self.data.edge_index_species, self.data.edge_attr_species, relabel_nodes=True)
+#             ds.bip_edge_index, ds.bip_edge_attr = bipartite_subgraph((torch.ones(self.data.x_spatial.size(0), dtype=torch.bool, device=self.data.x_spatial.device), mask), 
+#                                                                                     self.data.bip_edge_index, self.data.bip_edge_attr, relabel_nodes=True)
 
-    def forward(self, data):
-        return self.model(data)
+#     def forward(self, data):
+#         return self.model(data)
     
-    def train_dataloader(self):
-        return [self.train_data]
+#     def train_dataloader(self):
+#         return [self.train_data]
     
-    def val_dataloader(self):
-        return [self.test_data]
+#     def val_dataloader(self):
+#         return [self.test_data]
 
-    def training_step(self, batch, batch_idx):
-        out = self.model(batch)
-        loss = F.mse_loss(out, batch.y)
-        self.log('train_loss', loss)
-        return loss
+#     def training_step(self, batch, batch_idx):
+#         out = self.model(batch)
+#         loss = F.mse_loss(out, batch.y)
+#         self.log('train_loss', loss)
+#         return loss
 
-    def validation_step(self, batch, batch_idx):
-        out = self.model(batch)
-        loss = F.mse_loss(out, batch.y)
-        self.log('val_loss', loss)
+#     def validation_step(self, batch, batch_idx):
+#         out = self.model(batch)
+#         loss = F.mse_loss(out, batch.y)
+#         self.log('val_loss', loss)
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+#     def configure_optimizers(self):
+#         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)

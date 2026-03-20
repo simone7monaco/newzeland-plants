@@ -23,10 +23,10 @@ class NormalizeFeatures(BaseTransform):
     def __init__(self, normalizations=None):
         self.normalizations = normalizations or {
             'spatial_x': 'sincos', # They are latitude and longitude
-            'spatial_global_data': 'z',
-            'species_x_mean': 'z', # always positive and sometimes skewed, but managed elsewhere
+            'spatial_global_data': 'logz',
+            'species_x_mean': 'logz', # always positive and sometimes skewed, but managed elsewhere
             'species_x_gen': 'z',
-            'species_x_std': 'z',  # always positive and sometimes skewed, but
+            'species_x_std': 'z',
             'species_x_phylo': None, # x_phylo is a vector of embeddings, so no normalization
             'spatial_spatial_edge_attr': 'z',
             'species_species_edge_attr': 'z',
@@ -34,7 +34,42 @@ class NormalizeFeatures(BaseTransform):
         }
         self.props = {}
 
+    def fit(self, data: Data, eps: float = 1e-6):
+        if getattr(data, 'props', False):
+            print("Warning: Data already has props, overwriting\n")
+
+        for k_norm in self.normalizations:
+            if self.normalizations[k_norm] in ['logz', 'z']:
+                # log normalization and/or z normalization
+                if self.normalizations[k_norm] == 'logz':
+                    data_k_norm = torch.log(data[k_norm] + eps)
+                else:
+                    data_k_norm = data[k_norm]
+                mean = data_k_norm.mean(dim=0)
+                std = data_k_norm.std(dim=0)
+                std[std < eps] = 1.0 # prevent division by zero
+                self.props[k_norm] = {'mean': mean, 'std': std}
+            elif self.normalizations[k_norm] in ['sincos', None]:
+                pass
+            else:
+                raise ValueError(f"Unknown normalization: {self.normalizations[k_norm]}")
+            
+    def transform(self, data: Data, eps: float = 1e-6) -> Data:
+        return self.forward(data, eps)
+
+    def fit_transform(self, data: Data, eps: float = 1e-6) -> Data:
+        self.fit(data, eps)
+        return self.forward(data, eps)
+
     def forward(self, data: Data, eps: float = 1e-6) -> Data:
+        if getattr(data, 'normalized', False):
+            raise ValueError("Data is already normalized")
+
+        if not self.props:
+            print("Warning: No props found, computing on the fly (this may cause data leakage if done on the whole dataset instead of just the training set)\n")
+            self.fit(data, eps)
+        
+        setattr(data, 'normalized', True)
         for k_norm in self.normalizations:
             if self.normalizations[k_norm] == 'sincos':
                 data[k_norm] = data[k_norm] * np.pi / 180
@@ -44,19 +79,23 @@ class NormalizeFeatures(BaseTransform):
                 # log normalization and/or z normalization
                 if self.normalizations[k_norm] == 'logz':
                     data[k_norm] = torch.log(data[k_norm] + eps)
-                mean = data[k_norm].mean(dim=0)
-                std = data[k_norm].std(dim=0)
-                std[std < eps] = 1.0 # prevent division by zero
                 
-                data[k_norm] = (data[k_norm] - mean) / std
-                self.props[k_norm] = {'mean': mean, 'std': std}
+                data[k_norm] = (data[k_norm] - self.props[k_norm]['mean']) / self.props[k_norm]['std']
+
             elif self.normalizations[k_norm] is None:
                 pass
             else:
                 raise ValueError(f"Unknown normalization: {self.normalizations[k_norm]}")
+            if k_norm in ['species_x_mean', 'species_x_std']:
+                # prevent points in "nan_mask" from being normalized (they will be set to 0 after normalization, which is the mean value of the non-nan points)
+                data[k_norm] = data[k_norm] * ~data.traits_nanmask
         return data
     
     def inverse(self, data, warn=True):
+        if not getattr(data, 'normalized', False):
+            raise ValueError("Data is not normalized")
+        data.normalized = False
+
         data = data.clone()
         for k_norm in self.normalizations:
             if k_norm not in data.keys():
