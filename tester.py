@@ -28,6 +28,8 @@ import pandas as pd
 from pathlib import Path
 from tqdm import trange
 from scipy import stats as sp_stats
+import warnings
+from torch_geometric.data import Batch
 
 import matplotlib
 matplotlib.use("Agg")
@@ -141,7 +143,7 @@ def compute_metrics(pred_mean, pred_std, true_mean, eval_mask, trait_names):
             if np.std(p) > 1e-12 and np.std(t) > 1e-12
             else np.nan
         )
-        sr = float(sp_stats.spearmanr(p, t).statistic) if n_eval > 2 else np.nan
+        sr = float(sp_stats.spearmanr(p, t).statistic) if n_eval > 2 else np.nan # type: ignore
 
         # Coverage at nominal 90% and 95%
         covs = {}
@@ -170,7 +172,7 @@ def compute_metrics(pred_mean, pred_std, true_mean, eval_mask, trait_names):
 # =====================================================================
 
 def _species_ig(model, data, test_indices, trait_names, device,
-                n_steps=50, gen_col_names=None):
+                n_steps=50, internal_batch_size=None, gen_col_names=None):
     """
     IG attributions for **species-side** inputs
     (trait means, trait stds, genetic dummies, phylogenetic embeddings).
@@ -192,16 +194,93 @@ def _species_ig(model, data, test_indices, trait_names, device,
     n_traits = n_mean
 
     data_dev = data.to(device)
+    n_species_nodes = data.species_num_nodes
+    n_spatial_nodes = data.spatial_num_nodes
+    n_sp_feat = n_mean + n_std + n_gen + n_phylo
+
+    # TODO --- pre-loop: node-count consistency ---
+    assert data.species_x_mean.size(0) == n_species_nodes, \
+        f"species_x_mean rows {data.species_x_mean.size(0)} != species_num_nodes {n_species_nodes}"
+    assert data.species_x_std.size(0) == n_species_nodes, \
+        f"species_x_std rows {data.species_x_std.size(0)} != species_num_nodes {n_species_nodes}"
+    assert data.species_x_gen.size(0) == n_species_nodes, \
+        f"species_x_gen rows {data.species_x_gen.size(0)} != species_num_nodes {n_species_nodes}"
+    assert data.species_x_phylo.size(0) == n_species_nodes, \
+        f"species_x_phylo rows {data.species_x_phylo.size(0)} != species_num_nodes {n_species_nodes}"
+    assert n_mean == n_std, \
+        f"trait mean/std column-count mismatch: {n_mean} vs {n_std}"
+    assert data.spatial_x.size(0) == n_spatial_nodes, \
+        f"spatial_x rows {data.spatial_x.size(0)} != spatial_num_nodes {n_spatial_nodes}"
+    assert data.spatial_global_data.size(0) == n_spatial_nodes, \
+        f"spatial_global_data rows {data.spatial_global_data.size(0)} != spatial_num_nodes {n_spatial_nodes}"
+    # --- pre-loop: edge-index bounds ---
+    if data.species_species_edge_index.numel() > 0:
+        assert data.species_species_edge_index.max() < n_species_nodes, \
+            "species_species_edge_index out of [0, n_species_nodes)"
+    if data.spatial_spatial_edge_index.numel() > 0:
+        assert data.spatial_spatial_edge_index.max() < n_spatial_nodes, \
+            "spatial_spatial_edge_index out of [0, n_spatial_nodes)"
+    assert data.spatial_species_edge_index[0].max() < n_spatial_nodes, \
+        "spatial_species_edge_index spatial side out of [0, n_spatial_nodes)"
+    assert data.spatial_species_edge_index[1].max() < n_species_nodes, \
+        "spatial_species_edge_index species side out of [0, n_species_nodes)"
+    assert data.spatial_species_edge_attr.size(0) == data.spatial_species_edge_index.size(1), \
+        "spatial_species_edge_attr / edge_index size mismatch"
+    assert test_indices.max() < n_species_nodes, \
+        f"test_indices max {test_indices.max()} out of [0, n_species_nodes={n_species_nodes})"
+
+    _checked = [False]
 
     def forward_fn(sp_feat):
-        d = data_dev.clone()
-        i = 0
-        d.species_x_mean = sp_feat[:, i : i + n_mean]; i += n_mean
-        d.species_x_std = sp_feat[:, i : i + n_std]; i += n_std
-        d.species_x_gen = sp_feat[:, i : i + n_gen]; i += n_gen
-        d.species_x_phylo = sp_feat[:, i:]
+        first_call = not _checked[0]
+        if first_call:
+            assert sp_feat.size(0) % n_species_nodes == 0, (
+                f"sp_feat rows {sp_feat.size(0)} not divisible by "
+                f"n_species_nodes {n_species_nodes}"
+            )
+            assert sp_feat.size(1) == n_sp_feat, (
+                f"sp_feat cols {sp_feat.size(1)} != expected "
+                f"n_mean+n_std+n_gen+n_phylo={n_sp_feat}"
+            )
+
+        virtual_batch = sp_feat.size(0) // n_species_nodes
+
+        chunks = sp_feat.split(n_species_nodes, dim=0)
+        datas = []
+        for i, chunk in enumerate(chunks):
+            dtmp = data_dev.clone()
+            dtmp.species_x_mean, dtmp.species_x_std, dtmp.species_x_gen, dtmp.species_x_phylo = torch.split(
+                chunk, [n_mean, n_std, n_gen, n_phylo], dim=1
+            )
+            dtmp.num_nodes = n_species_nodes + data_dev.spatial_num_nodes
+            if first_call and i == 0:
+                # spatial features must be untouched by species-side perturbation
+                assert torch.equal(dtmp.spatial_x.detach(), data_dev.spatial_x.detach()), \
+                    "spatial_x was modified inside species IG forward_fn"
+                assert torch.equal(
+                    dtmp.spatial_global_data.detach(),
+                    data_dev.spatial_global_data.detach(),
+                ), "spatial_global_data was modified inside species IG forward_fn"
+                # all three edge-index tensors must be intact
+                assert torch.equal(
+                    dtmp.species_species_edge_index,
+                    data_dev.species_species_edge_index,
+                ), "species_species_edge_index changed inside species IG forward_fn"
+                assert torch.equal(
+                    dtmp.spatial_spatial_edge_index,
+                    data_dev.spatial_spatial_edge_index,
+                ), "spatial_spatial_edge_index changed inside species IG forward_fn"
+                assert torch.equal(
+                    dtmp.spatial_species_edge_index,
+                    data_dev.spatial_species_edge_index,
+                ), "spatial_species_edge_index changed inside species IG forward_fn"
+            datas.append(dtmp)
+
+        _checked[0] = True
+        d = Batch.from_data_list(datas)
         pm, _ = model(d)
-        return pm[test_indices]  # (n_test, n_traits)
+        pm = pm.view(virtual_batch, n_species_nodes, -1)[:, test_indices]
+        return pm.reshape(-1, pm.size(-1))
 
     sp_input = torch.cat([
         data.species_x_mean, data.species_x_std,
@@ -228,6 +307,7 @@ def _species_ig(model, data, test_indices, trait_names, device,
     for j in trange(n_traits, desc="Species IG"):
         attr = ig.attribute(
             sp_input, baselines=baseline, target=j, n_steps=n_steps,
+            internal_batch_size=internal_batch_size,
         )
         arr = attr[test_indices].detach().cpu().numpy()
         df_j = pd.DataFrame(arr, index=species_names, columns=all_cols)
@@ -244,7 +324,7 @@ def _species_ig(model, data, test_indices, trait_names, device,
 
 
 def _spatial_ig(model, data, test_indices, trait_names,
-                env_col_names, device, n_steps=30):
+                env_col_names, device, n_steps=30, internal_batch_size=None):
     """
     IG attributions for **spatial / environmental** features.
 
@@ -259,16 +339,95 @@ def _spatial_ig(model, data, test_indices, trait_names,
 
     model.eval()
     n_spatial_x = data.spatial_x.size(1)
+    n_global_x = data.spatial_global_data.size(1)
     n_traits = data.species_x_mean.size(1)
 
     data_dev = data.to(device)
+    n_sp_nodes = data.species_num_nodes
+    n_sa_nodes = data.spatial_num_nodes
+
+    # --- pre-loop: node-count consistency ---
+    assert data.spatial_x.size(0) == n_sa_nodes, \
+        f"spatial_x rows {data.spatial_x.size(0)} != spatial_num_nodes {n_sa_nodes}"
+    assert data.spatial_global_data.size(0) == n_sa_nodes, \
+        f"spatial_global_data rows {data.spatial_global_data.size(0)} != spatial_num_nodes {n_sa_nodes}"
+    assert data.species_x_mean.size(0) == n_sp_nodes, \
+        f"species_x_mean rows {data.species_x_mean.size(0)} != species_num_nodes {n_sp_nodes}"
+    assert data.species_x_gen.size(0) == n_sp_nodes, \
+        f"species_x_gen rows {data.species_x_gen.size(0)} != species_num_nodes {n_sp_nodes}"
+    assert data.species_x_phylo.size(0) == n_sp_nodes, \
+        f"species_x_phylo rows {data.species_x_phylo.size(0)} != species_num_nodes {n_sp_nodes}"
+    # --- pre-loop: edge-index bounds ---
+    if data.spatial_spatial_edge_index.numel() > 0:
+        assert data.spatial_spatial_edge_index.max() < n_sa_nodes, \
+            "spatial_spatial_edge_index out of [0, n_sa_nodes)"
+    if data.species_species_edge_index.numel() > 0:
+        assert data.species_species_edge_index.max() < n_sp_nodes, \
+            "species_species_edge_index out of [0, n_sp_nodes)"
+    assert data.spatial_species_edge_index[0].max() < n_sa_nodes, \
+        "spatial_species_edge_index spatial side out of [0, n_sa_nodes)"
+    assert data.spatial_species_edge_index[1].max() < n_sp_nodes, \
+        "spatial_species_edge_index species side out of [0, n_sp_nodes)"
+    assert data.spatial_species_edge_attr.size(0) == data.spatial_species_edge_index.size(1), \
+        "spatial_species_edge_attr / edge_index size mismatch"
+    assert test_indices.max() < n_sp_nodes, \
+        f"test_indices max {test_indices.max()} out of [0, n_sp_nodes={n_sp_nodes})"
+
+    _checked = [False]
 
     def forward_fn(spatial_feat):
-        d = data_dev.clone()
-        d.spatial_x = spatial_feat[:, :n_spatial_x]
-        d.spatial_global_data = spatial_feat[:, n_spatial_x:]
+        first_call = not _checked[0]
+        if first_call:
+            assert spatial_feat.size(0) % n_sa_nodes == 0, (
+                f"spatial_feat rows {spatial_feat.size(0)} not divisible by "
+                f"n_sa_nodes {n_sa_nodes}"
+            )
+            assert spatial_feat.size(1) == n_spatial_x + n_global_x, (
+                f"spatial_feat cols {spatial_feat.size(1)} != expected "
+                f"n_spatial_x+n_global_x={n_spatial_x + n_global_x}"
+            )
+
+        virtual_batch = spatial_feat.size(0) // n_sa_nodes
+
+        chunks = spatial_feat.split(n_sa_nodes, dim=0)
+        datas = []
+        for i, chunk in enumerate(chunks):
+            dtmp = data_dev.clone()
+            dtmp.spatial_x, dtmp.spatial_global_data = torch.split(
+                chunk, [n_spatial_x, chunk.size(1) - n_spatial_x], dim=1
+            )
+            dtmp.num_nodes = n_sp_nodes + n_sa_nodes
+            if first_call and i == 0:
+                # species features must be untouched by spatial-side perturbation
+                assert torch.equal(
+                    dtmp.species_x_mean.detach(), data_dev.species_x_mean.detach()
+                ), "species_x_mean was modified inside spatial IG forward_fn"
+                assert torch.equal(
+                    dtmp.species_x_gen.detach(), data_dev.species_x_gen.detach()
+                ), "species_x_gen was modified inside spatial IG forward_fn"
+                assert torch.equal(
+                    dtmp.species_x_phylo.detach(), data_dev.species_x_phylo.detach()
+                ), "species_x_phylo was modified inside spatial IG forward_fn"
+                # all three edge-index tensors must be intact
+                assert torch.equal(
+                    dtmp.species_species_edge_index,
+                    data_dev.species_species_edge_index,
+                ), "species_species_edge_index changed inside spatial IG forward_fn"
+                assert torch.equal(
+                    dtmp.spatial_spatial_edge_index,
+                    data_dev.spatial_spatial_edge_index,
+                ), "spatial_spatial_edge_index changed inside spatial IG forward_fn"
+                assert torch.equal(
+                    dtmp.spatial_species_edge_index,
+                    data_dev.spatial_species_edge_index,
+                ), "spatial_species_edge_index changed inside spatial IG forward_fn"
+            datas.append(dtmp)
+
+        _checked[0] = True
+        d = Batch.from_data_list(datas)
         pm, _ = model(d)
-        return pm[test_indices]
+        pm = pm.view(virtual_batch, n_sp_nodes, -1)[:, test_indices]
+        return pm.reshape(-1, pm.size(-1))
 
     spatial_input = torch.cat(
         [data.spatial_x, data.spatial_global_data], dim=1,
@@ -292,6 +451,7 @@ def _spatial_ig(model, data, test_indices, trait_names,
     for j in trange(n_traits, desc="Spatial IG"):
         attr = ig.attribute(
             spatial_input, baselines=baseline, target=j, n_steps=n_steps,
+            internal_batch_size=internal_batch_size,
         )
         attr_np = attr.detach().cpu().numpy()  # (n_spatial, n_feat)
 
@@ -429,6 +589,7 @@ def _plot_attribution_heatmap(attr_df, title, save_path, top_k=25):
 @torch.no_grad()
 def test_routine(model, data, norm_transform, trait_names, device,
                  save_dir="results", compute_xai=True, n_ig_steps=50,
+                 ig_internal_batch_size=None,
                  gen_col_names=None, env_col_names=None):
     """
     Full evaluation pipeline (call after training, with best weights loaded).
@@ -443,6 +604,10 @@ def test_routine(model, data, norm_transform, trait_names, device,
     save_dir       : str / Path  for all outputs
     compute_xai    : bool  whether to run IG  (Part 2, can be slow)
     n_ig_steps     : int   interpolation steps for Captum IG
+    ig_internal_batch_size : int | None  how many IG steps to process per forward pass.
+                             None → all n_ig_steps at once (one batch of n_ig_steps full
+                             graphs); use a smaller int (e.g. 1) to reduce peak memory
+                             at the cost of more forward/backward passes.
     gen_col_names  : list[str] | None  genetic dummy column names
     env_col_names  : list[str] | None  environmental feature column names
     """
@@ -492,15 +657,15 @@ def test_routine(model, data, norm_transform, trait_names, device,
 
     # -- original-space metrics --
     d_unnorm = norm_transform.inverse(
-        data.clone().to(device)._replace(species_x_mean=pred_mean, species_x_std=pred_std)
-    ).species_x_mean.cpu()
+        data.clone().update({'species_x_mean': pred_mean, 'species_x_std': pred_std}).cpu()
+    )
     inv_pred = d_unnorm.species_x_mean
     inv_std = d_unnorm.species_x_std
-    inv_true = norm_transform.inverse(data.clone().to(device)).species_x_mean.cpu()[test_indices]
+    inv_true = norm_transform.inverse(data.clone().cpu()).species_x_mean[test_indices.cpu()]
 
 
     metrics_orig = compute_metrics(
-        inv_pred, inv_std, inv_true, eval_mask, trait_names,
+        inv_pred, inv_std, inv_true, eval_mask.cpu(), trait_names,
     )
     metrics_orig.to_csv(
         save_dir / "per_trait_metrics_original.csv", index=False,
@@ -528,7 +693,7 @@ def test_routine(model, data, norm_transform, trait_names, device,
     # --- species-side ---
     sp_attr = _species_ig(
         model, data, test_indices, trait_names, device,
-        n_steps=n_ig_steps, gen_col_names=gen_col_names,
+        n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size, gen_col_names=gen_col_names,
     )
     sp_attr.to_csv(save_dir / "attributions_species.csv", index=False)
     _plot_attribution_heatmap(
@@ -549,7 +714,7 @@ def test_routine(model, data, norm_transform, trait_names, device,
             )
         sa_attr = _spatial_ig(
             model, data, test_indices, trait_names,
-            env_col_names, device, n_steps=n_ig_steps,
+            env_col_names, device, n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size,
         )
         sa_attr.to_csv(save_dir / "attributions_spatial.csv", index=False)
         _plot_attribution_heatmap(

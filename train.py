@@ -8,6 +8,7 @@ from train_baseline import compute_correlation
 from tester import test_routine
 from tqdm import trange
 from pathlib import Path
+import pandas as pd
 import pytorch_lightning as pl
 from copy import deepcopy
 import wandb
@@ -36,6 +37,8 @@ def get_args():
     parser = argparse.ArgumentParser(description='Train the model')
     parser.add_argument('-e', '--epochs', type=int, default=1000, help='Number of epochs to train the model')
     parser.add_argument('--use_env_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use environmental features')
+    parser.add_argument('--use_phylo_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use phylogenetic features')
+    parser.add_argument('--output_dir', type=Path, default='results/', help='Directory to save results and models')
 
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for the optimizer')
     parser.add_argument('--gnn_module', type=str, default='GATv2Conv', help="GNN attention module")#, choices=['GATConv', 'GATv2Conv', 'TransformerConv'])
@@ -115,11 +118,11 @@ def main(args):
     trait_names = list(dataset.traits_mean.columns)
     data = dataset[0]
 
-    model = TraitsPredictor(in_traits=data.species_x_mean.size(1), in_gen=data.species_x_gen.size(1), in_phylo=data.species_x_phylo.size(1), 
-                            in_space=data.spatial_global_data.size(1), out_channels=data.species_x_mean.size(1), 
+    model = TraitsPredictor(in_traits=data.species_x_mean.size(1), in_gen=data.species_x_gen.size(1), in_phylo=data.species_x_phylo.size(1),  # type: ignore
+                            in_space=data.spatial_global_data.size(1), out_channels=data.species_x_mean.size(1),  # type: ignore
                             hidden_channels=args.hidden_channels, num_layers=args.num_layers,
                             dropout=args.dropout, gnn_module=args.gnn_module, use_env_features=args.use_env_features,
-                            mask_ratio=args.mask_ratio)
+                            use_phylo_features=args.use_phylo_features, mask_ratio=args.mask_ratio)
 
     train_data, test_data = data_split(data, k=args.k, seed=seed)    
        
@@ -230,7 +233,7 @@ def main(args):
     # Save the model
     
     if args.save_model:
-        torch.save(best_model, f'best_model_{args.k}.pth')
+        torch.save(best_model, args.output_dir / f'best_model_{args.k}.pth')
     
     # Print final metrics at best epoch
     print(f"\nBest test loss: {best_test_loss:.4f} at epoch {best_epoch}")
@@ -249,33 +252,63 @@ def main(args):
     print("Launching full evaluation pipeline...")
     model.eval()
     test_routine(model, data, norm_transform, trait_names, device,
-                 save_dir=f'results/fold_{args.k}',
+                 save_dir=args.output_dir / f'fold_{args.k}',
                  compute_xai=True,
                  gen_col_names=gen_col_names)
 
     # --- Save per-feature error bar plots for train and test ---
-    with torch.no_grad():
-        pred_mean_train, pred_std_train = model(train_data)
-        pred_mean_test, pred_std_test = model(test_data)
+    # with torch.no_grad():
+    #     pred_mean_train, pred_std_train = model(train_data)
+    #     pred_mean_test, pred_std_test = model(test_data)
 
-    train_mask = ~train_data.traits_nanmask
-    test_mask = ~test_data.traits_nanmask
+    # train_mask = ~train_data.traits_nanmask
+    # test_mask = ~test_data.traits_nanmask
 
-    plots_dir = Path('plots')
-    plots_dir.mkdir(exist_ok=True)
+    # plots_dir = args.output_dir / 'plots'
+    # plots_dir.mkdir(exist_ok=True)
 
-    _save_error_bars(pred_mean_train, pred_std_train, train_data.species_x_mean, train_data.species_x_std, train_mask,
-                     plots_dir / f"errors_train_k{args.k}.png", f"Fold {args.k} Train", labels=trait_names)
-    _save_error_bars(pred_mean_test, pred_std_test, test_data.species_x_mean, test_data.species_x_std, test_mask,
-                     plots_dir / f"errors_test_k{args.k}.png", f"Fold {args.k} Test", labels=trait_names)
+    # _save_error_bars(pred_mean_train, pred_std_train, train_data.species_x_mean, train_data.species_x_std, train_mask,
+    #                  plots_dir / f"errors_train_k{args.k}.png", f"Fold {args.k} Train", labels=trait_names)
+    # _save_error_bars(pred_mean_test, pred_std_test, test_data.species_x_mean, test_data.species_x_std, test_mask,
+    #                  plots_dir / f"errors_test_k{args.k}.png", f"Fold {args.k} Test", labels=trait_names)
     
 
 if __name__ == "__main__":
     args = get_args()
-    for k in range(1):
+    exp_name = "fern_"
+    if args.use_env_features:
+        exp_name += "env_"
+    if args.use_phylo_features:
+        exp_name += "phylo_"
+    if not args.use_env_features and not args.use_phylo_features:
+        exp_name += "base"
+    if exp_name.endswith('_'):
+        exp_name = exp_name[:-1]
+    args.output_dir = Path(args.output_dir) / exp_name.upper()
+
+    print(f"""
++------------------------------------------------------
+| Starting training with config:
+|   Epochs: {args.epochs}
+|   Learning Rate: {args.lr}
+|   ...
+|   Use Env Features: {args.use_env_features}
+|   Use Phylo Features: {args.use_phylo_features}
+|   
+""")
+
+    for k in range(5):
         print(f"Running fold {k+1}/5")
         args.k = k
         main(args)
+
+    # Finally, concatenate all csv files in results/fold_*/ {attributions_spatial, attributions_species, predictions_mean, predictions_std} into single csv files in results/ for easier analysis
+    for file_type in ['attributions_spatial', 'attributions_species', 'predictions_mean', 'predictions_std']:
+        df_cat = pd.concat([pd.read_csv(subdir / f"{file_type}.csv") for subdir in args.output_dir.glob('fold_*')], ignore_index=True)
+        df_cat.to_csv(args.output_dir / f"{file_type}_all.csv", index=False)
+        print(f"Saved concatenated {file_type} to {args.output_dir / f'{file_type}_all.csv'}")
+
+
         
 
 

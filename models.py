@@ -62,19 +62,21 @@ class GNN(nn.Module):
 class TraitsPredictor(nn.Module):
     def __init__(self, in_traits, in_gen, in_phylo, in_space, hidden_channels, out_channels, 
                  num_layers, dropout=0.3, gnn_module='GATConv', eps=1e-6, mask_ratio=0.15, 
-                 mask_strategy='random', use_env_features=True):
+                 mask_strategy='random', use_env_features=True, use_phylo_features=True):
         super(TraitsPredictor, self).__init__()
         gnn = getattr(pyg_nn, gnn_module)
+        self.use_phylo_features = use_phylo_features
+        effective_phylo = in_phylo if use_phylo_features else 0
 
         if use_env_features:
             pos_embedding_dim = 4 # sin-cos embeddings for latitude and longitude
             self.space_gnn = GNN(in_space+pos_embedding_dim, hidden_channels, hidden_channels, num_layers=num_layers, gnn=gnn, dropout=dropout)
             
             # Species-side: considering using only non-target  inputs at that stage
-            self.bipartite_conv = pyg_nn.GATConv((hidden_channels, in_gen + in_phylo), hidden_channels, edge_dim=1, add_self_loops=False)
+            self.bipartite_conv = pyg_nn.GATConv((hidden_channels, in_gen + effective_phylo), hidden_channels, edge_dim=1, add_self_loops=False)
 
         # mean_traits, std_traits, visibility_mask, gen_features, phylo_features
-        self.species_linear = nn.Linear(3*in_traits + in_gen + in_phylo, hidden_channels)
+        self.species_linear = nn.Linear(3*in_traits + in_gen + effective_phylo, hidden_channels)
         self.species_gnn = GNN(hidden_channels + hidden_channels, hidden_channels, hidden_channels, num_layers=num_layers, gnn=gnn, dropout=dropout)
         
         # Predict mean and log_std separately (2 * out_channels)
@@ -83,6 +85,7 @@ class TraitsPredictor(nn.Module):
         self.mask_ratio = mask_ratio  # Fraction of observed traits to mask during training
         self.mask_strategy = mask_strategy  # 'random', 'blockwise', or 'balanced'
         self.use_env_features = use_env_features
+        self.use_phylo_features = use_phylo_features
         self.space_attention_weights = None
         self.bip_attention_weights = None
         self.species_attention_weights = None
@@ -147,7 +150,8 @@ class TraitsPredictor(nn.Module):
         else:
             visibility_mask = observed_mask.float()
         
-        species_input = torch.cat([species_x_mean, species_x_std, visibility_mask, data.species_x_gen, data.species_x_phylo], dim=1)
+        phylo_feats = [data.species_x_phylo] if self.use_phylo_features else []
+        species_input = torch.cat([species_x_mean, species_x_std, visibility_mask, data.species_x_gen] + phylo_feats, dim=1)
         species_input = self.species_linear(species_input).relu()
         
         if self.use_env_features:
@@ -160,7 +164,7 @@ class TraitsPredictor(nn.Module):
                 self.space_attention_weights = attention_weights
             space_embeddings = space_embeddings.relu()
 
-            species_part = torch.cat([data.species_x_gen, data.species_x_phylo], dim=1)
+            species_part = torch.cat([data.species_x_gen] + phylo_feats, dim=1)
             space_to_species = self.bipartite_conv((space_embeddings, species_part), data.spatial_species_edge_index,
                                 edge_attr=data.spatial_species_edge_attr,
                                 size=(space_embeddings.size(0), data.species_x_mean.size(0)),
@@ -233,7 +237,7 @@ class DeterministicLoss(nn.Module):
         super(DeterministicLoss, self).__init__()
         self.reduction = reduction
 
-    def forward(self, pred_mean, pred_std, target_mean, target_std=None, mask=None) -> torch.Tensor:
+    def forward(self, pred_mean, pred_std, target_mean, target_std, mask=None) -> torch.Tensor:
         """
             Deterministic loss: Huber loss on both mean and std predictions.
         """
@@ -302,7 +306,7 @@ class MixedNLLLoss(nn.Module):
         mu = log_m - 0.5 * sigma2
         return mu, sigma2.sqrt()
     
-    def forward(self, pred_mean, pred_std, target_mean, target_std=None, mask=None) -> torch.Tensor:
+    def forward(self, pred_mean, pred_std, target_mean, target_std, mask=None) -> torch.Tensor:
         """
             Mixed loss:
             - Point targets: Huber loss on mean

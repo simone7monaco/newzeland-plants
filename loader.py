@@ -142,7 +142,7 @@ class PlantDataset(InMemoryDataset):
         raster = xr.open_dataarray(f, engine="rasterio")
         current_step = (raster.x[1] - raster.x[0]).values # degrees
         downsample = round(grid_step / current_step)
-        raster = raster.coarsen(x=downsample, y=downsample, boundary="trim").sum().fillna(0)
+        raster = raster.coarsen(x=downsample, y=downsample, boundary="trim").sum().fillna(0) # type: ignore
         return raster
     
     
@@ -215,10 +215,10 @@ class PlantDataset(InMemoryDataset):
         return df
 
     def get_species_graph(self):
-        tree_file = next(self.root.glob('*.nwk'), None)
+        tree_file = next(Path(self.root).glob('*.nwk'), None)
         if tree_file is None:
             raise RuntimeError('Phylogenetic tree file not found.')
-        tree = Phylo.read(tree_file, "newick")
+        tree = Phylo.read(tree_file, "newick") # pyright: ignore[reportPrivateImportUsage]
 
         G = nx.Graph()
         for clade in tree.get_nonterminals():  # Internal nodes (non-leaf)
@@ -347,6 +347,7 @@ class PlantDataset(InMemoryDataset):
         spatial_species_edge_attr=bip_edge_attr,
         species_num_nodes=species_graph.num_nodes,
         spatial_num_nodes=spatial_graph.num_nodes,
+        num_nodes=species_graph.num_nodes + spatial_graph.num_nodes,
         )
         self.save([data_all], self.processed_paths[0])
     
@@ -376,7 +377,7 @@ def data_split(data, test_size=0.3, k=0, seed=42):
             cs.loc[community.index, 'community'] = (community.species_idx // (len(community) // 5)).astype(int) + cs.community.max() + 1
 
     splitter = KFold(n_splits=5, random_state=seed, shuffle=True)
-    splits = [s for s in splitter.split(G.nodes())]
+    splits = [s for s in splitter.split(G.nodes())] # type: ignore
     #splits = [s for s in splitter.split(G.nodes(), groups=cs.community)]
     train_nodes, test_nodes = splits[k]
 
@@ -401,6 +402,8 @@ def data_split(data, test_size=0.3, k=0, seed=42):
     test_data.traits_nanmask = test_data.traits_nanmask[test_mask]
     train_data.species_num_nodes = train_mask.sum().item()
     test_data.species_num_nodes = test_mask.sum().item()
+    train_data.num_nodes = train_data.species_num_nodes + train_data.spatial_num_nodes
+    test_data.num_nodes = test_data.species_num_nodes + test_data.spatial_num_nodes
     
 
     for data_split, mask in zip([train_data, test_data], [train_mask, test_mask]):
@@ -409,7 +412,7 @@ def data_split(data, test_size=0.3, k=0, seed=42):
             edge_attr=data.species_species_edge_attr,
             relabel_nodes=True
             )
-        data_split.spatial_species_edge_index, data_split.spatial_species_edge_attr = bipartite_subgraph(
+        data_split.spatial_species_edge_index, data_split.spatial_species_edge_attr = bipartite_subgraph( # type: ignore
             (torch.ones(data.spatial_num_nodes, dtype=torch.bool), mask), 
             edge_index=data.spatial_species_edge_index, edge_attr=data.spatial_species_edge_attr, relabel_nodes=True
             )
@@ -422,7 +425,7 @@ if __name__ == '__main__':
     re_unnormed_data = norm_transform.inverse(normed_data)
 
     for k in norm_transform.normalizations:
-        if not torch.allclose(data[k], re_unnormed_data[k]):
+        if not torch.allclose(data[k], re_unnormed_data[k]): # type: ignore
             print(f"Normalization failed for {k} (max diff: {torch.max(torch.abs(data[k] - re_unnormed_data[k]))})")
         # n, k = k.split('/')
         # if len(n.split('-')) > 1:
