@@ -1,0 +1,12 @@
+biopython
+kerchunk
+matplotlib
+netcdf4
+node2vec
+openpyxl
+rioxarray
+scikit-learn
+scipy
+seaborn
+optuna
+PyYAML

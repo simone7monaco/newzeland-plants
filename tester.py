@@ -35,6 +35,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+import wandb
 
 
 # =====================================================================
@@ -165,6 +166,57 @@ def compute_metrics(pred_mean, pred_std, true_mean, eval_mask, trait_names):
         ))
 
     return pd.DataFrame(records)
+
+
+def compute_conformal_residual_bounds(
+    pred_mean,
+    pred_std,
+    true_mean,
+    eval_mask,
+    trait_names,
+    alpha=0.10,
+    eps=1e-8,
+):
+    """Compute trait-wise split-conformal residual bounds.
+
+    The nonconformity score is |y - y_hat| / sigma. For each trait, the
+    returned q_hat is the (1 - alpha) empirical quantile of that score over
+    evaluated cells, and the boolean mask marks evaluated cells that satisfy
+    the conformal bound.
+    """
+    records = []
+    reliable_mask = torch.zeros_like(eval_mask, dtype=torch.bool)
+
+    n_traits = pred_mean.size(1)
+    for j in range(n_traits):
+        m = eval_mask[:, j]
+        n_eval = int(m.sum().item())
+        if n_eval < 2:
+            records.append(dict(
+                trait=trait_names[j], n=n_eval, alpha=alpha,
+                q_hat=np.nan, mean_abs_residual=np.nan,
+                empirical_coverage=np.nan,
+            ))
+            continue
+
+        p = pred_mean[m, j].detach().cpu().numpy()
+        s = pred_std[m, j].detach().cpu().numpy()
+        t = true_mean[m, j].detach().cpu().numpy()
+        score = np.abs(t - p) / np.maximum(s, eps)
+        q_hat = float(np.quantile(score, 1.0 - alpha))
+        within = score <= q_hat
+        reliable_mask[m, j] = torch.as_tensor(within, device=eval_mask.device)
+
+        records.append(dict(
+            trait=trait_names[j],
+            n=n_eval,
+            alpha=alpha,
+            q_hat=q_hat,
+            mean_abs_residual=float(np.mean(np.abs(t - p))),
+            empirical_coverage=float(np.mean(within)),
+        ))
+
+    return pd.DataFrame(records), reliable_mask
 
 
 # =====================================================================
@@ -474,6 +526,183 @@ def _spatial_ig(model, data, test_indices, trait_names,
 
 
 # =====================================================================
+# Sanity checks
+# =====================================================================
+
+def sanity_check_results(
+    metrics: pd.DataFrame,
+    pred_mean: torch.Tensor,
+    pred_std: torch.Tensor,
+    true_mean: torch.Tensor,
+    eval_mask: torch.Tensor,
+    trait_names: list,
+    sp_attr: "pd.DataFrame | None" = None,
+    sa_attr: "pd.DataFrame | None" = None,
+    min_eval_fraction: float = 0.10,
+    coverage_tol: float = 0.15,
+) -> dict:
+    """
+    Post-evaluation sanity checks.  Prints colour-coded PASS / WARN / SKIP
+    lines and returns a dict with one bool per check (True = passed).
+
+    Checks
+    ------
+    1.  no_nan_predictions   – no NaN in pred_mean / pred_std at evaluated slots
+    2.  beats_mean_baseline  – per-trait RMSE < baseline (predict-zero RMSE in
+                               z-normalised space ≈ std(true) ≈ 1.0)
+    3.  non_constant_preds   – for each trait, std(pred_mean) > 1e-4
+                               (rules out a model that always predicts the same value)
+    4.  coverage_calibration – observed 90 / 95 % coverages within ±tol of nominal
+    5.  pearson_spearman_sign – Pearson r and Spearman ρ agree in sign for every
+                               trait where both are finite
+    6.  eval_coverage        – every trait with any observations has at least
+                               min_eval_fraction of test species evaluated
+    7.  ig_nonzero_species   – (if sp_attr given) mean |IG| > 1e-6 for ≥ 50 %
+                               of species feature columns
+    8.  ig_self_attribution  – (if sp_attr given) mean_{trait} column ranks top-3
+                               for its own target trait
+    9.  ig_nonzero_spatial   – (if sa_attr given) same non-zero check as (7)
+    """
+    _GREEN  = "\033[92m"
+    _YELLOW = "\033[93m"
+    _CYAN   = "\033[96m"
+    _BOLD   = "\033[1m"
+    _RESET  = "\033[0m"
+
+    results: dict[str, bool] = {}
+
+    def _ok(name: str, passed: bool, msg: str = ""):
+        results[name] = passed
+        colour = _GREEN if passed else _YELLOW
+        tag    = "PASS " if passed else "WARN "
+        suffix = f"  ({msg})" if msg else ""
+        print(f"  {colour}{_BOLD}[{tag}]{_RESET} {name}{suffix}")
+
+    def _skip(name: str, reason: str = ""):
+        suffix = f"  ({reason})" if reason else ""
+        print(f"  {_CYAN}[SKIP ]{_RESET} {name}{suffix}")
+
+    print(f"\n{_BOLD}====== Sanity checks ======{_RESET}")
+
+    # 1. No NaN at evaluated slots
+    pm_np = pred_mean.cpu().numpy()
+    ps_np = pred_std.cpu().numpy()
+    em_np = eval_mask.cpu().numpy()
+    nan_pred = np.isnan(pm_np[em_np]).sum()
+    nan_std  = np.isnan(ps_np[em_np]).sum()
+    _ok("no_nan_predictions", nan_pred == 0 and nan_std == 0,
+        f"{nan_pred} nan means, {nan_std} nan stds in evaluated positions")
+
+    # 2. Beat trivial predict-zero baseline (z-normalised space: baseline RMSE ≈ std(true))
+    baseline_fail = []
+    for idx, row in metrics.iterrows():
+        if np.isnan(row["RMSE"]) or row["n"] < 2:
+            continue
+        m = em_np[:, idx]
+        t = true_mean.cpu().numpy()[m, idx]
+        baseline_rmse = float(np.sqrt(np.mean(t ** 2)))  # predict-zero RMSE
+        if row["RMSE"] >= baseline_rmse:
+            baseline_fail.append(
+                f"{row['trait']} (model={row['RMSE']:.3f} vs baseline={baseline_rmse:.3f})"
+            )
+    _ok("beats_mean_baseline", len(baseline_fail) == 0,
+        "; ".join(baseline_fail) if baseline_fail else "")
+
+    # 3. Non-constant predictions
+    constant_preds = []
+    for idx, row in metrics.iterrows():
+        m = em_np[:, idx]
+        if m.sum() < 2:
+            continue
+        p = pm_np[m, idx]
+        if np.std(p) < 1e-4:
+            constant_preds.append(f"{row['trait']} (std={np.std(p):.2e})")
+    _ok("non_constant_preds", len(constant_preds) == 0,
+        "; ".join(constant_preds) if constant_preds else "")
+
+    # 5. Coverage calibration within tolerance
+    cov_issues = []
+    for col, nominal in [("Coverage_90", 0.90), ("Coverage_95", 0.95)]:
+        observed = metrics[col].dropna().mean()
+        if abs(observed - nominal) > coverage_tol:
+            cov_issues.append(
+                f"{col}: observed={observed:.3f}, nominal={nominal:.3f}, "
+                f"Δ={observed - nominal:+.3f}"
+            )
+    _ok("coverage_calibration", len(cov_issues) == 0,
+        "; ".join(cov_issues) if cov_issues else "")
+
+    # 6. Pearson / Spearman sign agreement
+    sign_conflicts = []
+    for _, row in metrics.iterrows():
+        pr, sr = row["Pearson_r"], row["Spearman_rho"]
+        if np.isnan(pr) or np.isnan(sr):
+            continue
+        if np.sign(pr) != np.sign(sr):
+            sign_conflicts.append(
+                f"{row['trait']} (Pearson={pr:.3f}, Spearman={sr:.3f})"
+            )
+    _ok("pearson_spearman_sign", len(sign_conflicts) == 0,
+        "; ".join(sign_conflicts) if sign_conflicts else "")
+
+    # 7. Eval coverage per trait
+    n_test = em_np.shape[0]
+    thin_traits = []
+    for idx, row in metrics.iterrows():
+        n_obs = int(em_np[:, idx].sum())
+        frac = n_obs / max(n_test, 1)
+        if n_obs > 0 and frac < min_eval_fraction:
+            thin_traits.append(f"{row['trait']} ({n_obs}/{n_test}={frac:.1%})")
+    _ok("eval_coverage", len(thin_traits) == 0,
+        "; ".join(thin_traits) if thin_traits else "")
+
+    # 8–9. Species-side IG checks
+    if sp_attr is not None:
+        feat_cols = [c for c in sp_attr.columns if c not in {"species", "target_trait"}]
+
+        # 8. Non-zero attributions
+        mean_abs = sp_attr[feat_cols].abs().mean()
+        nonzero_frac = (mean_abs > 1e-6).mean()
+        _ok("ig_nonzero_species", nonzero_frac >= 0.5,
+            f"only {nonzero_frac:.1%} of species features have mean |IG| > 1e-6")
+
+        # 9. Self-attribution: mean_{trait} should rank top-3 for its own target
+        self_attr_fail = []
+        for t in trait_names:
+            col = f"mean_{t}"
+            if col not in sp_attr.columns:
+                continue
+            subset = sp_attr[sp_attr["target_trait"] == t]
+            if subset.empty:
+                continue
+            ranked = subset[feat_cols].abs().mean().nlargest(3).index.tolist()
+            if col not in ranked:
+                rank = int(subset[feat_cols].abs().mean().rank(ascending=False)[col])
+                self_attr_fail.append(f"{t} (rank {rank})")
+        _ok("ig_self_attribution", len(self_attr_fail) == 0,
+            "; ".join(self_attr_fail[:5]) + ("…" if len(self_attr_fail) > 5 else ""))
+    else:
+        _skip("ig_nonzero_species",  "no species attributions")
+        _skip("ig_self_attribution", "no species attributions")
+
+    # 10. Spatial IG non-zero
+    if sa_attr is not None:
+        feat_cols_sa = [c for c in sa_attr.columns if c not in {"species", "target_trait"}]
+        mean_abs_sa = sa_attr[feat_cols_sa].abs().mean()
+        nonzero_frac_sa = (mean_abs_sa > 1e-6).mean()
+        _ok("ig_nonzero_spatial", nonzero_frac_sa >= 0.5,
+            f"only {nonzero_frac_sa:.1%} of spatial features have mean |IG| > 1e-6")
+    else:
+        _skip("ig_nonzero_spatial", "no spatial attributions")
+
+    n_pass = sum(results.values())
+    n_total = len(results)
+    colour = _GREEN if n_pass == n_total else _YELLOW
+    print(f"\n  {colour}{_BOLD}{n_pass}/{n_total} checks passed.{_RESET}")
+    return results
+
+
+# =====================================================================
 # Visualisation helpers
 # =====================================================================
 
@@ -561,6 +790,37 @@ def _plot_scatter_pred_vs_true(pred_mean, true_mean, eval_mask,
     plt.close(fig)
 
 
+def _plot_scatter_pred_vs_true_per_trait(pred_mean, true_mean, eval_mask, trait_names, save_dir):
+    """Create one predicted-vs-true scatter figure per trait and save it."""
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    saved_paths = []
+    for j, trait_name in enumerate(trait_names):
+        fig, ax = plt.subplots(figsize=(4.5, 4.5))
+        m = eval_mask[:, j]
+        if m.sum() < 2:
+            ax.set_title(trait_name + " (n<2)")
+        else:
+            p = pred_mean[m, j].cpu().numpy()
+            t = true_mean[m, j].cpu().numpy()
+            ax.scatter(t, p, s=12, alpha=0.65, edgecolors="none")
+            lo = float(min(t.min(), p.min()))
+            hi = float(max(t.max(), p.max()))
+            ax.plot([lo, hi], [lo, hi], "k--", lw=0.8, alpha=0.55)
+            corr = np.corrcoef(p, t)[0, 1] if np.std(p) > 1e-12 and np.std(t) > 1e-12 else np.nan
+            ax.set_title(f"{trait_name} (r={corr:.3f})" if not np.isnan(corr) else trait_name)
+        ax.set(xlabel="True", ylabel="Predicted")
+        plt.tight_layout()
+
+        path = save_dir / f"scatter_pred_vs_true_{j:03d}_{trait_name}.png"
+        plt.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        saved_paths.append(path)
+
+    return saved_paths
+
+
 def _plot_attribution_heatmap(attr_df, title, save_path, top_k=25):
     """Mean |attribution| heat-map: target_trait x input feature."""
     exclude = {"species", "target_trait"}
@@ -586,145 +846,278 @@ def _plot_attribution_heatmap(attr_df, title, save_path, top_k=25):
 # Main entry point
 # =====================================================================
 
-@torch.no_grad()
-def test_routine(model, data, norm_transform, trait_names, device,
-                 save_dir="results", compute_xai=True, n_ig_steps=50,
-                 ig_internal_batch_size=None,
-                 gen_col_names=None, env_col_names=None):
-    """
-    Full evaluation pipeline (call after training, with best weights loaded).
+class Tester:
+    def __init__(self, device):
+        self.device = device
+        self.metrics = pd.DataFrame()
+        self.conformal_bounds = pd.DataFrame()
+        self.sp_attr = pd.DataFrame()
+        self.sa_attr = pd.DataFrame()
+        self.pred_mean = torch.empty(0)
+        self.pred_std = torch.empty(0)
+        self.true_mean = torch.empty(0)
+        self.eval_mask = torch.empty(0)
+        self.conformal_reliable_mask = torch.empty(0, dtype=torch.bool)
+        self.explainability_eval_mask = torch.empty(0, dtype=torch.bool)
+        self.scatterplot_paths: list[Path] = []
+        self._orig_mean_dfs: list[pd.DataFrame] = []
+        self._orig_std_dfs: list[pd.DataFrame] = []
 
-    Parameters
-    ----------
-    model          : TraitsPredictor with best weights loaded
-    data           : full (unsplit) normalised HeteroData with .test_mask
-    norm_transform : NormalizeFeatures  (for inverse normalisation)
-    trait_names    : list[str]  trait column names
-    device         : torch.device
-    save_dir       : str / Path  for all outputs
-    compute_xai    : bool  whether to run IG  (Part 2, can be slow)
-    n_ig_steps     : int   interpolation steps for Captum IG
-    ig_internal_batch_size : int | None  how many IG steps to process per forward pass.
-                             None → all n_ig_steps at once (one batch of n_ig_steps full
-                             graphs); use a smaller int (e.g. 1) to reduce peak memory
-                             at the cost of more forward/backward passes.
-    gen_col_names  : list[str] | None  genetic dummy column names
-    env_col_names  : list[str] | None  environmental feature column names
-    """
-    save_dir = Path(save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
+    @torch.no_grad()
+    def test_routine(self, model, data, norm_transform, trait_names, device,
+                    save_dir="results", compute_xai=True, n_ig_steps=50,
+                    ig_internal_batch_size=None,
+                    gen_col_names=None, env_col_names=None,
+                    conformal_alpha=0.10,
+                    log_wandb=True):
+        """
+        Full evaluation pipeline (call after training, with best weights loaded).
 
-    model.to(device).eval()
-    data = data.to(device)
-    test_indices = torch.where(data.test_mask)[0]
-    species_names = [data.species_names[i] for i in test_indices.cpu().numpy()]
+        Parameters
+        ----------
+        model          : TraitsPredictor with best weights loaded
+        data           : full (unsplit) normalised HeteroData with .test_mask
+        norm_transform : NormalizeFeatures  (for inverse normalisation)
+        trait_names    : list[str]  trait column names
+        device         : torch.device
+        save_dir       : str / Path  for all outputs
+        compute_xai    : bool  whether to run IG  (Part 2, can be slow)
+        n_ig_steps     : int   interpolation steps for Captum IG
+        ig_internal_batch_size : int | None  how many IG steps to process per forward pass.
+                                None → all n_ig_steps at once (one batch of n_ig_steps full
+                                graphs); use a smaller int (e.g. 1) to reduce peak memory
+                                at the cost of more forward/backward passes.
+        gen_col_names  : list[str] | None  genetic dummy column names
+        env_col_names  : list[str] | None  environmental feature column names
+        """
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
 
-    # == Part 1: Leave-one-trait-out ==============================
-    print("\n====== Part 1: Leave-one-trait-out evaluation ======")
-    pred_mean, pred_std, eval_mask = leave_one_trait_out(
-        model, data, test_indices, device,
-    )
+        model.to(device).eval()
+        data = data.to(device)
+        test_indices = torch.where(data.test_mask)[0]
+        species_names = [data.species_names[i] for i in test_indices.cpu().numpy()]
 
-    true_mean = data.species_x_mean[test_indices]
+        # == Part 1: Leave-one-trait-out ==============================
+        print("\n====== Part 1: Leave-one-trait-out evaluation ======")
+        pred_mean, pred_std, eval_mask = leave_one_trait_out(
+            model, data, test_indices, device,
+        )
 
-    # -- normalised-space metrics --
-    metrics = compute_metrics(
-        pred_mean, pred_std, true_mean, eval_mask, trait_names,
-    )
-    num_cols = [
-        "RMSE", "MAE", "Pearson_r", "Spearman_rho",
-        "Coverage_90", "Coverage_95", "CRPS",
-    ]
-    summary = metrics[num_cols].agg(["mean", "std", "median"])
+        true_mean = data.species_x_mean[test_indices]
 
-    print("\nPer-trait metrics (normalised space):")
-    print(metrics.to_string(index=False, float_format="%.4f"))
-    print("\nAggregate  (mean +/- std):")
-    for c in num_cols:
-        print(f"  {c:15s}: {summary.loc['mean', c]:.4f} "
-              f"+/- {summary.loc['std', c]:.4f}")
+        # -- normalised-space metrics --
+        metrics = compute_metrics(
+            pred_mean, pred_std, true_mean, eval_mask, trait_names,
+        )
+        num_cols = [
+            "RMSE", "MAE", "Pearson_r", "Spearman_rho",
+            "Coverage_90", "Coverage_95", "CRPS",
+        ]
+        summary = metrics[num_cols].agg(["mean", "std", "median"])
 
-    metrics.to_csv(save_dir / "per_trait_metrics.csv", index=False)
-    summary.to_csv(save_dir / "summary_metrics.csv")
+        print("\nPer-trait metrics (normalised space):")
+        print(metrics.to_string(index=False, float_format="%.4f"))
+        print("\nAggregate  (mean +/- std):")
+        for c in num_cols:
+            print(f"  {c:15s}: {summary.loc['mean', c]:.4f} "
+                f"+/- {summary.loc['std', c]:.4f}")
 
-    # -- save raw predictions --
-    pd.DataFrame(
-        pred_mean.cpu().numpy(), index=species_names, columns=trait_names,
-    ).to_csv(save_dir / "predictions_mean.csv")
-    pd.DataFrame(
-        pred_std.cpu().numpy(), index=species_names, columns=trait_names,
-    ).to_csv(save_dir / "predictions_std.csv")
+        metrics.to_csv(save_dir / "per_trait_metrics.csv", index=False)
+        summary.to_csv(save_dir / "summary_metrics.csv")
 
-    # -- original-space metrics --
-    d_unnorm = norm_transform.inverse(
-        data.clone().update({'species_x_mean': pred_mean, 'species_x_std': pred_std}).cpu()
-    )
-    inv_pred = d_unnorm.species_x_mean
-    inv_std = d_unnorm.species_x_std
-    inv_true = norm_transform.inverse(data.clone().cpu()).species_x_mean[test_indices.cpu()]
+        # -- save raw predictions --
+        pd.DataFrame(
+            pred_mean.cpu().numpy(), index=species_names, columns=trait_names,
+        ).to_csv(save_dir / "predictions_mean.csv")
+        pd.DataFrame(
+            pred_std.cpu().numpy(), index=species_names, columns=trait_names,
+        ).to_csv(save_dir / "predictions_std.csv")
+
+        # -- original-space metrics --
+        d_unnorm = norm_transform.inverse(
+            data.clone().update({'species_x_mean': pred_mean, 'species_x_std': pred_std}).cpu(),
+            soft_clip=True,
+        )
+        inv_pred = d_unnorm.species_x_mean
+        inv_std = d_unnorm.species_x_std
+        inv_true = norm_transform.inverse(data.clone().cpu()).species_x_mean[test_indices.cpu()]
 
 
-    metrics_orig = compute_metrics(
-        inv_pred, inv_std, inv_true, eval_mask.cpu(), trait_names,
-    )
-    metrics_orig.to_csv(
-        save_dir / "per_trait_metrics_original.csv", index=False,
-    )
-    print("\nOriginal-space metrics:")
-    for _, row in metrics_orig.iterrows():
-        print(f"  {row['trait']:25s}:  RMSE={row['RMSE']:.4f}  "
-                f"r={row['Pearson_r']:.4f}")
+        metrics_orig = compute_metrics(
+            inv_pred, inv_std, inv_true, eval_mask.cpu(), trait_names,
+        )
+        metrics_orig.to_csv(
+            save_dir / "per_trait_metrics_original.csv", index=False,
+        )
 
-    # -- plots (Part 1) --
-    _plot_per_trait_metrics(metrics, save_dir / "metrics_per_trait.png")
-    _plot_coverage_calibration(metrics, save_dir / "coverage_calibration.png")
-    _plot_scatter_pred_vs_true(
-        pred_mean, true_mean, eval_mask, trait_names,
-        save_dir / "scatter_pred_vs_true.png",
-    )
+        conformal_bounds, conformal_reliable_mask = compute_conformal_residual_bounds(
+            inv_pred, inv_std, inv_true, eval_mask.cpu(), trait_names, alpha=conformal_alpha,
+        )
+        conformal_bounds.to_csv(save_dir / "conformal_residual_bounds.csv", index=False)
+        self.conformal_bounds = conformal_bounds
+        self.conformal_reliable_mask = conformal_reliable_mask
+        self.explainability_eval_mask = eval_mask.cpu() & conformal_reliable_mask
 
-    # == Part 2: Integrated Gradients =============================
-    if not compute_xai:
-        print("\nXAI analysis skipped (compute_xai=False).")
+        print("\nOriginal-space metrics:")
+        for _, row in metrics_orig.iterrows():
+            print(f"  {row['trait']:25s}:  RMSE={row['RMSE']:.4f}  "
+                    f"r={row['Pearson_r']:.4f}")
+        print("\nConformal residual bounds (original space):")
+        print(conformal_bounds.to_string(index=False, float_format="%.4f"))
+
+        # -- save original-space predictions per fold --
+        orig_mean_df = pd.DataFrame(
+            inv_pred.cpu().numpy(), index=species_names, columns=trait_names,
+        )
+        orig_std_df = pd.DataFrame(
+            inv_std.cpu().numpy(), index=species_names, columns=trait_names,
+        )
+        orig_mean_df.to_csv(save_dir / "predictions_mean_original.csv")
+        orig_std_df.to_csv(save_dir / "predictions_std_original.csv")
+        self._orig_mean_dfs.append(orig_mean_df)
+        self._orig_std_dfs.append(orig_std_df)
+
+        # -- plots (Part 1) --
+        _plot_per_trait_metrics(metrics, save_dir / "metrics_per_trait.png")
+        _plot_coverage_calibration(metrics, save_dir / "coverage_calibration.png")
+        _plot_scatter_pred_vs_true(
+            pred_mean, true_mean, eval_mask, trait_names,
+            save_dir / "scatter_pred_vs_true.png",
+        )
+        self.scatterplot_paths = _plot_scatter_pred_vs_true_per_trait(
+            pred_mean, true_mean, eval_mask, trait_names, save_dir / "scatterplots",
+        )
+
+        if log_wandb and wandb.run is not None:
+            wandb_scatter_logs = {}
+            for j, trait_name in enumerate(trait_names):
+                m = eval_mask[:, j]
+                if m.sum() < 2:
+                    continue
+
+                x_values = true_mean[m, j].detach().cpu().numpy().tolist()
+                y_values = pred_mean[m, j].detach().cpu().numpy().tolist()
+                data = [[x, y] for x, y in zip(x_values, y_values)]
+                table = wandb.Table(data=data, columns=["x", "y"])
+                safe_trait_name = str(trait_name).replace("/", "_")
+                wandb_scatter_logs[f"scatter/{j:03d}_{safe_trait_name}"] = wandb.plot.scatter(
+                    table,
+                    "x",
+                    "y",
+                    title=f"{trait_name} predicted vs true",
+                )
+
+            if wandb_scatter_logs:
+                wandb.log(wandb_scatter_logs)
+
+        # == Part 2: Integrated Gradients =============================
+        sp_attr: pd.DataFrame | None = None
+        sa_attr: pd.DataFrame | None = None
+
+        if not compute_xai:
+            print("\nXAI analysis skipped (compute_xai=False).")
+        else:
+            print("\n====== Part 2: Integrated Gradients attribution ======")
+
+            # --- species-side ---
+            sp_attr = _species_ig(
+                model, data, test_indices, trait_names, device,
+                n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size, gen_col_names=gen_col_names,
+            )
+            sp_attr.to_csv(save_dir / "attributions_species.csv", index=False)
+            _plot_attribution_heatmap(
+                sp_attr,
+                "Species-side feature importance  (mean |IG|)",
+                save_dir / "heatmap_species_ig.png",
+            )
+            print(f"  Species attributions saved  ({len(sp_attr)} rows).")
+
+            # --- spatial / environmental side ---
+            if model.use_env_features:
+                if env_col_names is None:
+                    n_pos = data.spatial_x.size(1)
+                    n_glob = data.spatial_global_data.size(1)
+                    env_col_names = (
+                        [f"pos_{i}" for i in range(n_pos)]
+                        + [f"env_{i}" for i in range(n_glob)]
+                    )
+                sa_attr = _spatial_ig(
+                    model, data, test_indices, trait_names,
+                    env_col_names, device, n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size,
+                )
+                sa_attr.to_csv(save_dir / "attributions_spatial.csv", index=False)
+                _plot_attribution_heatmap(
+                    sa_attr,
+                    "Spatial / Environmental feature importance  (mean |IG|)",
+                    save_dir / "heatmap_spatial_ig.png",
+                )
+                print(f"  Spatial attributions saved  ({len(sa_attr)} rows).")
+            else:
+                print("  Spatial IG skipped (use_env_features=False).")
+
+        print(f"\nAll results saved to  {save_dir}/")
+        if self.metrics.empty:
+            self.metrics = metrics
+            self.sp_attr = sp_attr
+            self.sa_attr = sa_attr
+            self.pred_mean = pred_mean
+            self.pred_std = pred_std
+            self.true_mean = true_mean
+            self.eval_mask = eval_mask
+
+        else:
+            self.metrics = pd.concat([self.metrics, metrics], ignore_index=True)
+            self.sp_attr = pd.concat([self.sp_attr, sp_attr], ignore_index=True)
+            if sa_attr is not None:
+                self.sa_attr = pd.concat([self.sa_attr, sa_attr], ignore_index=True)
+            self.pred_mean = torch.cat([self.pred_mean, pred_mean], dim=0) if self.pred_mean is not None else pred_mean
+            self.pred_std = torch.cat([self.pred_std, pred_std], dim=0) if self.pred_std is not None else pred_std
+            self.true_mean = torch.cat([self.true_mean, true_mean], dim=0) if self.true_mean is not None else true_mean
+            self.eval_mask = torch.cat([self.eval_mask, eval_mask], dim=0) if self.eval_mask is not None else eval_mask
+
         return metrics
 
-    print("\n====== Part 2: Integrated Gradients attribution ======")
+    def save_merged_original_predictions(self, save_dir=Path("results")):
+        """Merge original-space predictions from all folds and save to CSV."""
+        if not self._orig_mean_dfs:
+            print("No original-space predictions to merge. Run test_routine() first.")
+            return
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- species-side ---
-    sp_attr = _species_ig(
-        model, data, test_indices, trait_names, device,
-        n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size, gen_col_names=gen_col_names,
-    )
-    sp_attr.to_csv(save_dir / "attributions_species.csv", index=False)
-    _plot_attribution_heatmap(
-        sp_attr,
-        "Species-side feature importance  (mean |IG|)",
-        save_dir / "heatmap_species_ig.png",
-    )
-    print(f"  Species attributions saved  ({len(sp_attr)} rows).")
+        merged_mean = pd.concat(self._orig_mean_dfs)
+        merged_std = pd.concat(self._orig_std_dfs)
 
-    # --- spatial / environmental side ---
-    if model.use_env_features:
-        if env_col_names is None:
-            n_pos = data.spatial_x.size(1)
-            n_glob = data.spatial_global_data.size(1)
-            env_col_names = (
-                [f"pos_{i}" for i in range(n_pos)]
-                + [f"env_{i}" for i in range(n_glob)]
-            )
-        sa_attr = _spatial_ig(
-            model, data, test_indices, trait_names,
-            env_col_names, device, n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size,
+        # Rename columns to distinguish mean vs std, then join into one file
+        merged_mean_renamed = merged_mean.add_suffix("_mean")
+        merged_std_renamed = merged_std.add_suffix("_std")
+        merged = merged_mean_renamed.join(merged_std_renamed)
+        merged.index.name = "species"
+        merged.to_csv(save_dir / "predictions_original_all_folds.csv")
+        print(f"Merged original-space predictions saved to {save_dir}/predictions_original_all_folds.csv")
+
+    def sanity_checks(self):
+        self.metrics = self.metrics.groupby("trait").agg({
+            "n": "sum",
+            "RMSE": "mean",
+            "MAE": "mean",
+            "Pearson_r": "mean",
+            "Spearman_rho": "mean",
+            "Coverage_90": "mean",
+            "Coverage_95": "mean",
+            "CRPS": "mean",
+        }).reset_index()
+
+        if self.metrics.empty:
+            print("No metrics available for sanity checks. Run test_routine() first.")
+            return
+        self.sanity_results = sanity_check_results(
+            self.metrics, self.pred_mean, self.pred_std, self.true_mean, self.eval_mask,
+            self.metrics["trait"].tolist(), sp_attr=self.sp_attr, sa_attr=self.sa_attr,
         )
-        sa_attr.to_csv(save_dir / "attributions_spatial.csv", index=False)
-        _plot_attribution_heatmap(
-            sa_attr,
-            "Spatial / Environmental feature importance  (mean |IG|)",
-            save_dir / "heatmap_spatial_ig.png",
-        )
-        print(f"  Spatial attributions saved  ({len(sa_attr)} rows).")
-    else:
-        print("  Spatial IG skipped (use_env_features=False).")
-
-    print(f"\nAll results saved to  {save_dir}/")
-    return metrics
+        # sanity_check_results(
+        #     metrics, pred_mean, pred_std, true_mean, eval_mask, trait_names,
+        #     sp_attr=sp_attr,
+        #     sa_attr=sa_attr,
+        # )

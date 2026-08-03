@@ -1,17 +1,18 @@
 import argparse
 import torch
 import torch.nn.functional as F
-import numpy as np
 from loader import PlantDataset, NormalizeFeatures, data_split
 from models import TraitsPredictor, DeterministicLoss, MixedNLLLoss, graph_smoothness_loss
 from train_baseline import compute_correlation
-from tester import test_routine
+from tester import Tester
 from tqdm import trange
 from pathlib import Path
 import pandas as pd
 import pytorch_lightning as pl
 from copy import deepcopy
 import wandb
+import optuna
+import yaml
 
 import matplotlib.pyplot as plt
 
@@ -33,12 +34,17 @@ pl.seed_everything(seed)
 torch.cuda.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 
+
 def get_args():
     parser = argparse.ArgumentParser(description='Train the model')
     parser.add_argument('-e', '--epochs', type=int, default=1000, help='Number of epochs to train the model')
     parser.add_argument('--use_env_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use environmental features')
     parser.add_argument('--use_phylo_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use phylogenetic features')
     parser.add_argument('--output_dir', type=Path, default='results/', help='Directory to save results and models')
+    parser.add_argument('--trait_norm_mean', type=str, default='logz', choices=['z', 'yj', 'logz'], help='Trait normalization mode for mean features')
+    parser.add_argument('--trait_norm_std', type=str, default='z', choices=['z', 'yj', 'logz'], help='Trait normalization mode for std features')
+    parser.add_argument('--per_trait_loss', type=str2bool, nargs='?', const=True, default=True, help='Use per-trait loss reduction instead of flat entry-wise averaging')
+    parser.add_argument('--k', type=int, default=-1, help='Fold index for cross-validation (0-4). Use -1 to perform a complete run over all folds sequentially.')
 
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for the optimizer')
     parser.add_argument('--gnn_module', type=str, default='GATv2Conv', help="GNN attention module")#, choices=['GATConv', 'GATv2Conv', 'TransformerConv'])
@@ -53,66 +59,26 @@ def get_args():
     parser.add_argument('--smoothness_weight', type=float, default=0.0, help='Weight for the graph smoothness loss')
     parser.add_argument('--visible_loss_weight', type=float, default=0.2, help='Weight for the reconstruction loss on visible (non-masked) entries')
     parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping (0 to disable)')
-    
+    parser.add_argument('--compute_xai', type=str2bool, nargs='?', const=True, default=False, help='Whether to compute XAI attributions during testing (can be slow)')
+
     parser.add_argument('--test_logging_step', type=int, default=1, help='Step for test logging')
     parser.add_argument('--save_model', action='store_true', help='Save the model after training')
     parser.add_argument('--use_wb', type=str2bool, default=False, nargs='?', const=True, help='Use Weights & Biases for logging')
+    parser.add_argument('--run_optuna', action='store_true', help='Run an Optuna sweep from a sweep YAML file')
+    parser.add_argument('--optuna_sweep', type=str, default=None, help='Path to Optuna sweep YAML file (grid format)')
     return parser.parse_args()
 
 
-# --- Save per-feature error bar plots for train and test ---
-def _save_error_bars(pred_mean, pred_std, true_mean, true_std, mask, out_path, title, labels=None):
-    # pred_*/true_*: torch tensors shape (N, D); mask: boolean tensor shape (N, D) where True=valid
-    pred_mean_np = pred_mean.detach().cpu().numpy()
-    pred_std_np = pred_std.detach().cpu().numpy()
-    true_mean_np = true_mean.detach().cpu().numpy()
-    true_std_np = true_std.detach().cpu().numpy()
-    mask_np = mask.detach().cpu().numpy()
-
-    # For mean: compute per-feature RMSE and variability (std of absolute errors)
-    mean_diff = pred_mean_np - true_mean_np
-    mean_sq = mean_diff**2
-    mean_rmse = np.sqrt(np.nanmean(np.where(mask_np, mean_sq, np.nan), axis=0))
-    mean_var = np.nanstd(np.where(mask_np, np.abs(mean_diff), np.nan), axis=0)
-
-    # For std: compute per-feature RMSE and variability
-    std_diff = pred_std_np - true_std_np
-    std_sq = std_diff**2
-    std_rmse = np.sqrt(np.nanmean(np.where(mask_np, std_sq, np.nan), axis=0))
-    std_var = np.nanstd(np.where(mask_np, np.abs(std_diff), np.nan), axis=0)
-
-    D = pred_mean_np.shape[1]
-    x = np.arange(D)
-    fig, axes = plt.subplots(2, 1, figsize=(max(8, D * 0.25), 8))
-    axes[0].bar(x, mean_rmse, yerr=mean_var, capsize=3)
-    axes[0].set_title(f"{title} — Mean RMSE per feature")
-    axes[0].set_xlabel("Feature")
-    axes[0].set_ylabel("RMSE")
-    if labels is not None:
-        axes[0].set_xticks(x)
-        axes[0].set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
-
-    axes[1].bar(x, std_rmse, yerr=std_var, capsize=3)
-    axes[1].set_title(f"{title} — Std RMSE per feature")
-    axes[1].set_xlabel("Feature")
-    axes[1].set_ylabel("RMSE")
-    if labels is not None:
-        axes[1].set_xticks(x)
-        axes[1].set_xticklabels(labels, rotation=45, ha='right', fontsize=8)
-
-    plt.tight_layout()
-    out_dir = Path(out_path).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    plt.savefig(out_path)
-    plt.close(fig)
-
-
-def main(args):
-    wandb.init(project='fern-sweep', config=args, mode='disabled' if not args.use_wb else 'online')
+def main(args, tester: Tester, trial: optuna.trial.Trial | None = None):
+    if args.use_wb:
+        wandb.init(project='fern-sweep', config=args, mode='online')
+    else:
+        # keep wandb disabled when not requested to avoid clutter
+        wandb.init(project='fern-sweep', config=args, mode='disabled')
     
     print(f"---------------\nTraining with args: {args}")
 
-    norm_transform = NormalizeFeatures()
+    norm_transform = NormalizeFeatures(trait_norm_mean=args.trait_norm_mean, trait_norm_std=args.trait_norm_std)
     data_path = Path(f'data/Ferns/')
     dataset = PlantDataset(data_path, transform=norm_transform)
     trait_names = list(dataset.traits_mean.columns)
@@ -141,12 +107,13 @@ def main(args):
         scheduler = None
     
     if args.loss == 'deterministic':
-        loss_fn = DeterministicLoss()
+        loss_fn = DeterministicLoss(per_trait_reduction=args.per_trait_loss)
         if args.kl_weight != 0.0:
             print("Warning: KL weight is ignored when using deterministic loss.\n")
     else:
         loss_fn = MixedNLLLoss(distribution=args.loss.split('_')[1], 
-                               kl_weight=args.kl_weight)
+                               kl_weight=args.kl_weight,
+                               per_trait_reduction=args.per_trait_loss)
     
     best_test_loss = float('inf')
     best_model = None
@@ -184,15 +151,15 @@ def main(args):
 
         optimizer.step()
         if scheduler is not None:
-            scheduler.step(loss)
+            scheduler.step() if args.scheduler != 'plateau' else scheduler.step(loss)
 
         log_dict = {
             'train_loss': loss.item(), 
             'graph_smoothness_loss': gs_loss.item(),
             'lr': optimizer.param_groups[0]['lr'],
             } | loss_fn.cache
-        
-        wandb.log(log_dict, step=epoch)
+        if args.use_wb:
+            wandb.log(log_dict, step=epoch)
         
         if epoch % args.test_logging_step == 0:
             model.eval()
@@ -228,10 +195,19 @@ def main(args):
                     # 'test_coverage_90': coverage[0.9].item(),
                     # 'test_coverage_95': coverage[0.95].item(),
                 } | loss_fn.cache
-                wandb.log(log_dict, step=epoch)
+                if args.use_wb:
+                    wandb.log(log_dict, step=epoch)
 
-    # Save the model
-    
+                # Report objective metric to Optuna when running under a trial
+                if trial is not None:
+                    try:
+                        trial.report(float(mean_rmse.item()), epoch)
+                        if trial.should_prune():
+                            raise optuna.TrialPruned()
+                    except Exception:
+                        # ignore reporting errors for compatibility with non-pruning samplers
+                        pass
+
     if args.save_model:
         torch.save(best_model, args.output_dir / f'best_model_{args.k}.pth')
     
@@ -240,8 +216,8 @@ def main(args):
     print(f"\t Mean RMSE: {best_mean_rmse:.4f}")
     print(f"\t Correlation: {best_correlation:.4f}")
 
-    wandb.log({'best_test_loss': best_test_loss}, step=best_epoch)
-    wandb.finish()
+    if args.use_wb:
+        wandb.log({'best_test_loss': best_test_loss}, step=best_epoch)
 
     # ensure best model is loaded for final evaluation
     if best_model is not None:
@@ -251,26 +227,15 @@ def main(args):
     gen_col_names = list(dataset.traits_gen.columns)
     print("Launching full evaluation pipeline...")
     model.eval()
-    test_routine(model, data, norm_transform, trait_names, device,
-                 save_dir=args.output_dir / f'fold_{args.k}',
-                 compute_xai=True,
-                 gen_col_names=gen_col_names)
-
-    # --- Save per-feature error bar plots for train and test ---
-    # with torch.no_grad():
-    #     pred_mean_train, pred_std_train = model(train_data)
-    #     pred_mean_test, pred_std_test = model(test_data)
-
-    # train_mask = ~train_data.traits_nanmask
-    # test_mask = ~test_data.traits_nanmask
-
-    # plots_dir = args.output_dir / 'plots'
-    # plots_dir.mkdir(exist_ok=True)
-
-    # _save_error_bars(pred_mean_train, pred_std_train, train_data.species_x_mean, train_data.species_x_std, train_mask,
-    #                  plots_dir / f"errors_train_k{args.k}.png", f"Fold {args.k} Train", labels=trait_names)
-    # _save_error_bars(pred_mean_test, pred_std_test, test_data.species_x_mean, test_data.species_x_std, test_mask,
-    #                  plots_dir / f"errors_test_k{args.k}.png", f"Fold {args.k} Test", labels=trait_names)
+    tester.test_routine(model, data, norm_transform, trait_names, device,
+                        save_dir=args.output_dir / f'fold_{args.k}',
+                        compute_xai=args.compute_xai,
+                        gen_col_names=gen_col_names
+                       )
+    if args.use_wb:
+        wandb.finish()
+    # return main metric for Optuna
+    return float(best_mean_rmse) if 'best_mean_rmse' in locals() else float('nan')
     
 
 if __name__ == "__main__":
@@ -282,6 +247,8 @@ if __name__ == "__main__":
         exp_name += "phylo_"
     if not args.use_env_features and not args.use_phylo_features:
         exp_name += "base"
+    exp_name += f"_mean{args.trait_norm_mean}_std{args.trait_norm_std}"
+    exp_name += "_ptr" if args.per_trait_loss else "_flat"
     if exp_name.endswith('_'):
         exp_name = exp_name[:-1]
     args.output_dir = Path(args.output_dir) / exp_name.upper()
@@ -296,37 +263,78 @@ if __name__ == "__main__":
 |   Use Phylo Features: {args.use_phylo_features}
 |   
 """)
+    tester = Tester(device)
 
-    for k in range(5):
-        print(f"Running fold {k+1}/5")
-        args.k = k
-        main(args)
+    if args.run_optuna and args.optuna_sweep is not None:
+        # Load sweep YAML and run Optuna GridSampler
+        with open(args.optuna_sweep, 'r') as f:
+            sweep_cfg = yaml.safe_load(f)
 
-    # Finally, concatenate all csv files in results/fold_*/ {attributions_spatial, attributions_species, predictions_mean, predictions_std} into single csv files in results/ for easier analysis
-    for file_type in ['attributions_spatial', 'attributions_species', 'predictions_mean', 'predictions_std']:
-        df_cat = pd.concat([pd.read_csv(subdir / f"{file_type}.csv") for subdir in args.output_dir.glob('fold_*')], ignore_index=True)
-        df_cat.to_csv(args.output_dir / f"{file_type}_all.csv", index=False)
-        print(f"Saved concatenated {file_type} to {args.output_dir / f'{file_type}_all.csv'}")
+        method = sweep_cfg.get('method', 'grid')
+        metric = sweep_cfg.get('metric', {})
+        direction = 'minimize' if metric.get('goal', 'minimize') == 'minimize' else 'maximize'
+        params = sweep_cfg.get('parameters', {})
 
+        # Build search space dict for GridSampler: name -> list(values)
+        search_space = {}
+        for name, spec in params.items():
+            if 'values' in spec:
+                search_space[name] = spec['values']
+            elif 'value' in spec:
+                search_space[name] = [spec['value']]
+            else:
+                # unsupported spec; skip
+                continue
 
-        
+        if method != 'grid':
+            raise NotImplementedError('Only grid method is implemented for Optuna sweeps')
 
+        sampler = optuna.samplers.GridSampler(search_space)
+        study = optuna.create_study(direction=direction, sampler=sampler)
 
-# sweep_id = wandb.sweep(sweep_config, project='fern-sweep')
-# wandb.agent(sweep_id, lambda: main(args))
-# sweep_config = {
-#     'name': 'fern-sweep',
-#     'method': 'grid',
-#     'metric': {
-#         'name': 'best_test_loss',
-#         'goal': 'minimize'
-#     },
-#     'parameters': {
-#         'epochs': {'values': [1000]},
-#         'lr': {'values': [0.0005, 0.001, 0.005]},
-#         'hidden_channels': {'values': [16, 32, 64]},
-#         'num_layers': {'values': [2, 3, 4]},
-#         'dropout': {'values': [0.1, 0.2, 0.3]},
-#         'gnn_module': {'values': ['GATConv', 'Gatv2Conv', 'TransformerConv']}
-#     }
-# }
+        def objective(trial: optuna.trial.Trial):
+            # Build args copy and override with trial params
+            local_args = deepcopy(args)
+            # Ensure optuna flags off for nested runs
+            local_args.run_optuna = False
+            local_args.optuna_sweep = None
+
+            for name in search_space:
+                val = trial.suggest_categorical(name, search_space[name])
+                # convert common types
+                if name in ['per_trait_loss']:
+                    if isinstance(val, str):
+                        v = True if val.lower() in ('true', '1', 'yes') else False
+                    else:
+                        v = bool(val)
+                    setattr(local_args, name, v)
+                elif name in ['k']:
+                    setattr(local_args, name, int(val))
+                else:
+                    setattr(local_args, name, val)
+
+            local_tester = Tester(device)
+            metric_val = main(local_args, tester=local_tester, trial=trial)
+            return float(metric_val)
+
+        study.optimize(objective)
+        print('Best trial: ', study.best_trial.params)
+    else:
+        if args.k != -1:
+            print(f"Running fold {args.k+1}/5")
+            main(args, tester=tester)
+        else:
+            for k in range(5):
+                print(f"Running fold {k+1}/5")
+                args.k = k
+                main(args, tester=tester)
+
+        # Finally, concatenate all csv files in results/fold_*/ {attributions_spatial, attributions_species, predictions_mean, predictions_std} into single csv files in results/ for easier analysis
+        tester.save_merged_original_predictions(args.output_dir)
+        for file_type in ['attributions_spatial', 'attributions_species', 'predictions_mean', 'predictions_std']:
+            if not args.use_env_features and file_type == 'attributions_spatial':
+                continue
+            df_cat = pd.concat([pd.read_csv(subdir / f"{file_type}.csv") for subdir in args.output_dir.glob('fold_*')], ignore_index=True)
+            df_cat.to_csv(args.output_dir / f"{file_type}_all.csv", index=False)
+            print(f"Saved concatenated {file_type} to {args.output_dir / f'{file_type}_all.csv'}")
+        tester.sanity_checks()

@@ -8,10 +8,45 @@ from Bio import Phylo
 import networkx as nx
 from sklearn.cluster import SpectralClustering
 from sklearn.model_selection import GroupKFold, KFold
+from scipy.stats import yeojohnson as _scipy_yeojohnson
 
 import torch
 import sys
 from torch_geometric.data import Data, HeteroData
+
+
+def _yj_transform(x: np.ndarray, lmbda: float) -> np.ndarray:
+    """Apply Yeo-Johnson transform element-wise with the given lambda."""
+    out = np.empty_like(x, dtype=np.float64)
+    pos = x >= 0
+    neg = ~pos
+    lam = float(lmbda)
+    if abs(lam) < 1e-10:
+        out[pos] = np.log1p(x[pos])
+    else:
+        out[pos] = (np.power(x[pos] + 1.0, lam) - 1.0) / lam
+    if abs(lam - 2.0) < 1e-10:
+        out[neg] = -np.log1p(-x[neg])
+    else:
+        out[neg] = -(np.power(-x[neg] + 1.0, 2.0 - lam) - 1.0) / (2.0 - lam)
+    return out
+
+
+def _yj_inverse(y: np.ndarray, lmbda: float) -> np.ndarray:
+    """Invert the Yeo-Johnson transform element-wise."""
+    out = np.empty_like(y, dtype=np.float64)
+    pos = y >= 0
+    neg = ~pos
+    lam = float(lmbda)
+    if abs(lam) < 1e-10:
+        out[pos] = np.expm1(y[pos])
+    else:
+        out[pos] = np.power(np.clip(y[pos] * lam + 1.0, 0.0, None), 1.0 / lam) - 1.0
+    if abs(lam - 2.0) < 1e-10:
+        out[neg] = 1.0 - np.exp(-y[neg])
+    else:
+        out[neg] = 1.0 - np.power(np.clip(-(2.0 - lam) * y[neg] + 1.0, 0.0, None), 1.0 / (2.0 - lam))
+    return out
 from torch_geometric.transforms import KNNGraph, BaseTransform
 from torch_geometric.utils import from_networkx
 from torch_geometric.data import InMemoryDataset
@@ -19,14 +54,14 @@ from torch_geometric.utils import subgraph, bipartite_subgraph
 
 
 class NormalizeFeatures(BaseTransform):
-    r"""Row-normalizes the attributes using min-max scaling."""
-    def __init__(self, normalizations=None):
-        self.normalizations = normalizations or {
+    r"""Normalizes graph attributes; traits can use per-column Yeo-Johnson + z, others use z or sin/cos."""
+    def __init__(self, trait_norm_mean='yj', trait_norm_std='z'):
+        self.normalizations = {
             'spatial_x': 'sincos', # They are latitude and longitude
-            'spatial_global_data': 'logz',
-            'species_x_mean': 'logz', # always positive and sometimes skewed, but managed elsewhere
+            'spatial_global_data': 'z',
+            'species_x_mean': trait_norm_mean,
             'species_x_gen': 'z',
-            'species_x_std': 'z',
+            'species_x_std': trait_norm_std,
             'species_x_phylo': None, # x_phylo is a vector of embeddings, so no normalization
             'spatial_spatial_edge_attr': 'z',
             'species_species_edge_attr': 'z',
@@ -39,8 +74,33 @@ class NormalizeFeatures(BaseTransform):
             print("Warning: Data already has props, overwriting\n")
 
         for k_norm in self.normalizations:
-            if self.normalizations[k_norm] in ['logz', 'z']:
-                # log normalization and/or z normalization
+            if self.normalizations[k_norm] == 'yj':
+                # Per-column Yeo-Johnson fit (lambda) + post-transform z-statistics.
+                # Masked/missing entries (traits_nanmask) are excluded from fitting.
+                data_np = data[k_norm].float().numpy()  # (n_species, n_traits)
+                n_traits = data_np.shape[1]
+                lambdas = np.ones(n_traits, dtype=np.float64)
+                post_mean = np.zeros(n_traits, dtype=np.float64)
+                post_std = np.ones(n_traits, dtype=np.float64)
+                nan_mask_np = (
+                    data.traits_nanmask.numpy()
+                    if (hasattr(data, 'traits_nanmask') and k_norm in ['species_x_mean', 'species_x_std'])
+                    else np.zeros_like(data_np, dtype=bool)
+                )
+                for j in range(n_traits):
+                    valid = data_np[~nan_mask_np[:, j], j]
+                    if len(valid) >= 2:
+                        transformed, lam = _scipy_yeojohnson(valid)
+                        lambdas[j] = lam
+                        post_mean[j] = transformed.mean()
+                        s = transformed.std()
+                        post_std[j] = s if s > eps else 1.0
+                self.props[k_norm] = {
+                    'lambdas': torch.tensor(lambdas, dtype=torch.float32),
+                    'mean': torch.tensor(post_mean, dtype=torch.float32),
+                    'std': torch.tensor(post_std, dtype=torch.float32),
+                }
+            elif self.normalizations[k_norm] in ['logz', 'z']:
                 if self.normalizations[k_norm] == 'logz':
                     data_k_norm = torch.log(data[k_norm] + eps)
                 else:
@@ -75,23 +135,28 @@ class NormalizeFeatures(BaseTransform):
                 data[k_norm] = data[k_norm] * np.pi / 180
                 data[k_norm] = torch.stack([torch.sin(data[k_norm][:, 0]), torch.cos(data[k_norm][:, 0]),
                                           torch.sin(data[k_norm][:, 1]), torch.cos(data[k_norm][:, 1])], dim=1)
+            elif self.normalizations[k_norm] == 'yj':
+                props = self.props[k_norm]
+                lambdas = props['lambdas'].numpy()
+                data_np = data[k_norm].float().cpu().numpy()
+                for j in range(data_np.shape[1]):
+                    data_np[:, j] = _yj_transform(data_np[:, j], lambdas[j])
+                result = torch.tensor(data_np, dtype=data[k_norm].dtype, device=data[k_norm].device)
+                data[k_norm] = (result - props['mean'].to(result.device)) / props['std'].to(result.device)
             elif self.normalizations[k_norm] in ['logz', 'z']:
-                # log normalization and/or z normalization
                 if self.normalizations[k_norm] == 'logz':
                     data[k_norm] = torch.log(data[k_norm] + eps)
-                
                 data[k_norm] = (data[k_norm] - self.props[k_norm]['mean']) / self.props[k_norm]['std']
-
             elif self.normalizations[k_norm] is None:
                 pass
             else:
                 raise ValueError(f"Unknown normalization: {self.normalizations[k_norm]}")
             if k_norm in ['species_x_mean', 'species_x_std']:
-                # prevent points in "nan_mask" from being normalized (they will be set to 0 after normalization, which is the mean value of the non-nan points)
+                # Zero out masked entries so they equal the mean (0) in normalized space
                 data[k_norm] = data[k_norm] * ~data.traits_nanmask
         return data
     
-    def inverse(self, data, warn=True):
+    def inverse(self, data, warn=True, soft_clip=False, soft_clip_lower=0.0):
         if not getattr(data, 'normalized', False):
             raise ValueError("Data is not normalized")
         data.normalized = False
@@ -106,11 +171,24 @@ class NormalizeFeatures(BaseTransform):
                 lat = torch.atan2(data[k_norm][:, 0], data[k_norm][:, 1]) * 180 / np.pi
                 lon = torch.atan2(data[k_norm][:, 2], data[k_norm][:, 3]) * 180 / np.pi
                 data[k_norm] = torch.stack([lat, lon], dim=1)
+            elif self.normalizations[k_norm] == 'yj':
+                props = self.props[k_norm]
+                # Undo z-normalization
+                data[k_norm] = data[k_norm] * props['std'].to(data[k_norm].device) + props['mean'].to(data[k_norm].device)
+                # Undo Yeo-Johnson
+                lambdas = props['lambdas'].numpy()
+                data_np = data[k_norm].float().cpu().numpy()
+                for j in range(data_np.shape[1]):
+                    data_np[:, j] = _yj_inverse(data_np[:, j], lambdas[j])
+                data[k_norm] = torch.tensor(data_np, dtype=data[k_norm].dtype)
+                if soft_clip and k_norm == 'species_x_mean':
+                    data[k_norm] = soft_clip_lower + torch.nn.functional.softplus(data[k_norm] - soft_clip_lower)
             elif self.normalizations[k_norm] in ['logz', 'z']:
-                # log normalization and/or z normalization
                 data[k_norm] = data[k_norm] * self.props[k_norm]['std'] + self.props[k_norm]['mean']
                 if self.normalizations[k_norm] == 'logz':
                     data[k_norm] = torch.exp(data[k_norm]) - 1e-6
+                if soft_clip and k_norm == 'species_x_mean':
+                    data[k_norm] = soft_clip_lower + torch.nn.functional.softplus(data[k_norm] - soft_clip_lower)
         return data
     
 
@@ -348,6 +426,7 @@ class PlantDataset(InMemoryDataset):
         species_num_nodes=species_graph.num_nodes,
         spatial_num_nodes=spatial_graph.num_nodes,
         num_nodes=species_graph.num_nodes + spatial_graph.num_nodes,
+        features_names=self.traits_mean.columns.tolist()
         )
         self.save([data_all], self.processed_paths[0])
     

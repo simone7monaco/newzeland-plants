@@ -77,7 +77,8 @@ class TraitsPredictor(nn.Module):
 
         # mean_traits, std_traits, visibility_mask, gen_features, phylo_features
         self.species_linear = nn.Linear(3*in_traits + in_gen + effective_phylo, hidden_channels)
-        self.species_gnn = GNN(hidden_channels + hidden_channels, hidden_channels, hidden_channels, num_layers=num_layers, gnn=gnn, dropout=dropout)
+        species_gnn_in = hidden_channels + hidden_channels if use_env_features else hidden_channels
+        self.species_gnn = GNN(species_gnn_in, hidden_channels, hidden_channels, num_layers=num_layers, gnn=gnn, dropout=dropout)
         
         # Predict mean and log_std separately (2 * out_channels)
         self.fc = nn.Linear(hidden_channels, 2 * out_channels)
@@ -232,56 +233,76 @@ class TraitsPredictor(nn.Module):
         
         return coverage
 
+
+"""
+### Per-trait loss reduction
+
+Both `DeterministicLoss` and `MixedNLLLoss` use:
+
+$$\mathcal{L} = \frac{1}{|\mathcal{T}_{\text{active}}|} \sum_{j \in \mathcal{T}_{\text{active}}} \frac{1}{n_j} \sum_{i: \text{mask}_{ij}} \ell_{ij}$$
+
+instead of a flat mean over all `(sample, trait)` entries. This gives each trait equal gradient weight regardless of how many species it's observed in. 
+The `'sum'` reduction mode performs a simple sum over all entries.
+"""
 class DeterministicLoss(nn.Module):
-    def __init__(self, reduction='mean'):
+    def __init__(self, reduction='mean', per_trait_reduction=True):
         super(DeterministicLoss, self).__init__()
         self.reduction = reduction
+        self.per_trait_reduction = per_trait_reduction
 
     def forward(self, pred_mean, pred_std, target_mean, target_std, mask=None) -> torch.Tensor:
         """
             Deterministic loss: Huber loss on both mean and std predictions.
+            Reduction 'mean' averages per-trait means to give each trait equal weight.
         """
 
         if mask is None:
             mask = torch.ones_like(pred_mean, dtype=torch.bool)
 
-        n_valid = mask.sum()
-        if n_valid == 0:
+        if mask.sum() == 0:
             raise Warning("No valid entries to compute loss on.")
-        
-        huber_mean = F.huber_loss(
-            pred_mean[mask],
-            target_mean[mask],
-            reduction='sum',
-        )
+
         # some std targets may be NaN or zero; ignore those in loss
         std_mask = mask & (~torch.isnan(target_std)) & (target_std > 0)
-        huber_std = F.huber_loss(
-            pred_std[std_mask],
-            target_std[std_mask],
-            reduction='sum',
-        )
+
+        huber_mean_vals = F.huber_loss(pred_mean, target_mean, reduction='none')
+        huber_std_vals = F.huber_loss(pred_std, target_std, reduction='none')
+
         self.cache = {
-            'huber_mean': huber_mean.mean().item(),
-            'huber_std': huber_std.mean().item(),
+            'huber_mean': huber_mean_vals[mask].mean().item(),
+            'huber_std': huber_std_vals[std_mask].mean().item() if std_mask.any() else 0.0,
         }
-        full_loss = huber_mean + huber_std
-        
+
         if self.reduction == "sum":
-            return full_loss
-        elif self.reduction == "mean":
-            return full_loss / n_valid
+            return (huber_mean_vals * mask).sum() + (huber_std_vals * std_mask).sum()
+
+        if not self.per_trait_reduction:
+            full_loss = (huber_mean_vals * mask).sum() + (huber_std_vals * std_mask).sum()
+            return full_loss / mask.sum()
+
+        # Per-trait mean, then average over active traits
+        n_per_trait_mean = mask.float().sum(dim=0)          # (n_traits,)
+        n_per_trait_std = std_mask.float().sum(dim=0)       # (n_traits,)
+        active_mean = n_per_trait_mean > 0
+        active_std = n_per_trait_std > 0
+        loss_mean = ((huber_mean_vals * mask.float())[:, active_mean].sum(dim=0)
+                     / n_per_trait_mean[active_mean]).mean()
+        if active_std.any():
+            loss_std = ((huber_std_vals * std_mask.float())[:, active_std].sum(dim=0)
+                        / n_per_trait_std[active_std]).mean()
         else:
-            raise ValueError("reduction must be 'mean' or 'sum'.")
+            loss_std = torch.zeros((), device=pred_mean.device)
+        return loss_mean + loss_std
         
 class MixedNLLLoss(nn.Module):
     def __init__(self, distribution='lognormal', reduction='mean',
-                 kl_weight=1.0, eps=1e-6):
+                 kl_weight=1.0, eps=1e-6, per_trait_reduction=True):
         super(MixedNLLLoss, self).__init__()
         self.eps = eps
         self.distribution = distribution
         self.reduction = reduction
         self.kl_weight = kl_weight
+        self.per_trait_reduction = per_trait_reduction
         self.cache = {}
 
     def _lognormal_mean_std_to_normal_params(self, mean, std):
@@ -311,78 +332,75 @@ class MixedNLLLoss(nn.Module):
             Mixed loss:
             - Point targets: Huber loss on mean
             - Distribution targets: KL divergence between target and predicted distributions
+            Reduction 'mean' averages per-trait means to give each trait equal weight.
         """
 
         if mask is None:
             mask = torch.ones_like(pred_mean, dtype=torch.bool)
 
-        n_valid = mask.sum()
-        if n_valid == 0:
+        if mask.sum() == 0:
             raise Warning("No valid entries to compute loss on.")
-        
+
         if target_std is None:
             is_point_estimate = torch.ones_like(pred_mean, dtype=torch.bool)
-        else: # std not nan and > 0
+        else:
             is_point_estimate = torch.isnan(target_std) | (target_std <= 0)
-        
-        # Create separate masks for point estimates and distributions
+
         point_mask = mask & is_point_estimate
         dist_mask = mask & ~is_point_estimate
 
-        loss_sum = torch.zeros((), device=pred_mean.device)
+        # Accumulate per-entry losses in a 2D tensor for per-trait reduction
+        loss_2d = torch.zeros_like(pred_mean)
+        huber_scalar = torch.zeros((), device=pred_mean.device)
+        kl_scalar = torch.zeros((), device=pred_mean.device)
 
-        # ---- Point targets: Huber on mean in ORIGINAL space ----
+        # ---- Point targets: Huber on mean ----
         if point_mask.any():
-            huber = F.huber_loss(
-                pred_mean[point_mask],
-                target_mean[point_mask],
-                reduction="sum",
-            )
-            loss_sum = loss_sum + huber #* point_mask.sum()
+            huber_vals = F.huber_loss(pred_mean, target_mean, reduction='none')
+            loss_2d = torch.where(point_mask, huber_vals, loss_2d)
+            huber_scalar = huber_vals[point_mask].mean()
 
         # ---- Distribution targets: KL divergence ----
         if dist_mask.any():
-            # Clamp predicted std away from 0 for numerical stability in KL.
-            # (We do NOT use pred_std for point targets; only for dist targets.)
             if self.distribution == "normal":
                 mu_p = pred_mean[dist_mask]
                 sig_p = pred_std[dist_mask].clamp_min(self.eps)
-
                 mu_t = target_mean[dist_mask]
                 sig_t = target_std[dist_mask].clamp_min(self.eps)
-
             else:
                 pm = pred_mean[dist_mask].clamp_min(self.eps)
                 ps = pred_std[dist_mask].clamp_min(0.0)
-
                 tm = target_mean[dist_mask].clamp_min(self.eps)
                 ts = target_std[dist_mask].clamp_min(0.0)
-
                 mu_p, sig_p = self._lognormal_mean_std_to_normal_params(pm, ps)
                 mu_t, sig_t = self._lognormal_mean_std_to_normal_params(tm, ts)
-
                 sig_p = sig_p.clamp_min(self.eps)
                 sig_t = sig_t.clamp_min(self.eps)
 
             # KL( N(mu_t, sig_t^2) || N(mu_p, sig_p^2) )
             kl = torch.log(sig_p / sig_t) + (sig_t.pow(2) + (mu_t - mu_p).pow(2)) / (2.0 * sig_p.pow(2)) - 0.5
-            # KL( N(mu_p, sig_p^2) || N(mu_t, sig_t^2) )
-            # kl = torch.log(sig_t / sig_p) + (sig_p.pow(2) + (mu_p - mu_t).pow(2)) / (2.0 * sig_t.pow(2)) - 0.5
-
-            loss_sum = loss_sum + self.kl_weight * kl.sum() #* dist_mask.sum()
+            kl_scalar = kl.mean()
+            kl_2d = torch.zeros_like(pred_mean)
+            kl_2d[dist_mask] = self.kl_weight * kl
+            loss_2d = loss_2d + kl_2d
 
         self.cache = {
-            'huber': huber.mean().item() if point_mask.any() else 0.0,
-            'kl': kl.mean().item() if dist_mask.any() else 0.0,
+            'huber': huber_scalar.item(),
+            'kl': kl_scalar.item(),
         }
 
-
         if self.reduction == "sum":
-            return loss_sum
-        elif self.reduction == "mean":
-            return loss_sum / (dist_mask.sum() + point_mask.sum())
-        else:
-            raise ValueError("reduction must be 'mean' or 'sum'.")
+            return (loss_2d * mask.float()).sum()
+
+        if not self.per_trait_reduction:
+            return (loss_2d * mask.float()).sum() / mask.sum()
+
+        # Per-trait mean, then average over active traits
+        n_per_trait = mask.float().sum(dim=0)   # (n_traits,)
+        active = n_per_trait > 0
+        loss_per_trait = ((loss_2d * mask.float())[:, active].sum(dim=0)
+                          / n_per_trait[active])
+        return loss_per_trait.mean()
 
 
 
