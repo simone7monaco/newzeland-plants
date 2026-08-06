@@ -10,3 +10,5 @@ scipy
 seaborn
 optuna
 PyYAML
+lightning
+torch_geometric

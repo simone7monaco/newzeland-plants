@@ -2,7 +2,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 from loader import PlantDataset, NormalizeFeatures, data_split
-from models import TraitsPredictor, DeterministicLoss, MixedNLLLoss, graph_smoothness_loss
+from models import TraitsPredictor, DeterministicLoss, MixedNLLLoss, MultiTargetDeterministicLoss, graph_smoothness_loss
 from train_baseline import compute_correlation
 from tester import Tester
 from tqdm import trange
@@ -41,6 +41,8 @@ def get_args():
     parser.add_argument('--use_env_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use environmental features')
     parser.add_argument('--use_phylo_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use phylogenetic features')
     parser.add_argument('--output_dir', type=Path, default='results/', help='Directory to save results and models')
+    parser.add_argument('--trait_representation', type=str, default='min_max_range', choices=['mean_std', 'min_max_range'], help='Trait representation to use (mean/std or min/max/range)')
+
     parser.add_argument('--trait_norm_mean', type=str, default='logz', choices=['z', 'yj', 'logz'], help='Trait normalization mode for mean features')
     parser.add_argument('--trait_norm_std', type=str, default='z', choices=['z', 'yj', 'logz'], help='Trait normalization mode for std features')
     parser.add_argument('--per_trait_loss', type=str2bool, nargs='?', const=True, default=True, help='Use per-trait loss reduction instead of flat entry-wise averaging')
@@ -69,7 +71,7 @@ def get_args():
     return parser.parse_args()
 
 
-def main(args, tester: Tester, trial: optuna.trial.Trial | None = None):
+def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float:
     if args.use_wb:
         wandb.init(project='fern-sweep', config=args, mode='online')
     else:
@@ -80,15 +82,17 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None):
 
     norm_transform = NormalizeFeatures(trait_norm_mean=args.trait_norm_mean, trait_norm_std=args.trait_norm_std)
     data_path = Path(f'data/Ferns/')
-    dataset = PlantDataset(data_path, transform=norm_transform)
-    trait_names = list(dataset.traits_mean.columns)
+    trait_file = 'Traits.xlsx' if args.trait_representation == 'mean_std' else 'FernMinMax.xlsx'
+    dataset = PlantDataset(data_path, transform=norm_transform, trait_representation=args.trait_representation, traits_filename=trait_file)
+    trait_names = dataset.trait_names
     data = dataset[0]
 
-    model = TraitsPredictor(in_traits=data.species_x_mean.size(1), in_gen=data.species_x_gen.size(1), in_phylo=data.species_x_phylo.size(1),  # type: ignore
-                            in_space=data.spatial_global_data.size(1), out_channels=data.species_x_mean.size(1),  # type: ignore
+    model = TraitsPredictor(in_traits=len(trait_names), in_gen=data.species_x_gen.size(1), in_phylo=data.species_x_phylo.size(1),  # type: ignore
+                            in_space=data.spatial_global_data.size(1), out_channels=len(trait_names),  # type: ignore
                             hidden_channels=args.hidden_channels, num_layers=args.num_layers,
                             dropout=args.dropout, gnn_module=args.gnn_module, use_env_features=args.use_env_features,
-                            use_phylo_features=args.use_phylo_features, mask_ratio=args.mask_ratio)
+                            use_phylo_features=args.use_phylo_features, mask_ratio=args.mask_ratio,
+                            trait_representation=args.trait_representation)
 
     train_data, test_data = data_split(data, k=args.k, seed=seed)    
        
@@ -105,8 +109,14 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     else:
         scheduler = None
-    
-    if args.loss == 'deterministic':
+
+    trait_feature_keys = ['species_x_mean', 'species_x_std']  # default for mean/std representation
+    if args.trait_representation == 'min_max_range':
+        if args.loss != 'deterministic':
+            print('Warning: distribution losses apply only to mean/std; using deterministic min/max/range loss.\n')
+        loss_fn = MultiTargetDeterministicLoss(per_trait_reduction=args.per_trait_loss)
+        trait_feature_keys = ['species_x_min', 'species_x_max', 'species_x_range']
+    elif args.loss == 'deterministic':
         loss_fn = DeterministicLoss(per_trait_reduction=args.per_trait_loss)
         if args.kl_weight != 0.0:
             print("Warning: KL weight is ignored when using deterministic loss.\n")
@@ -123,22 +133,31 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None):
         model.train()
         optimizer.zero_grad()
         
-        pred_mean, pred_std = model(train_data)
+        predictions = model(train_data)
+        train_targets = tuple(getattr(train_data, key) for key in trait_feature_keys)
 
         observed_mask = ~train_data.traits_nanmask
         if model.reconstruction_mask is not None:
             masked_entries = model.reconstruction_mask  # True where observed traits were masked
             visible_entries = observed_mask & ~masked_entries  # True where observed traits are still visible
             # Full loss on masked entries (the primary denoising objective)
-            loss_masked = loss_fn(pred_mean, pred_std, train_data.species_x_mean, train_data.species_x_std, masked_entries)
+            if args.trait_representation == 'mean_std':
+                loss_masked = loss_fn(*predictions, *train_targets, masked_entries)
+                loss_visible = loss_fn(*predictions, *train_targets, visible_entries)
+            else:
+                loss_masked = loss_fn(predictions, train_targets, masked_entries)
+                loss_visible = loss_fn(predictions, train_targets, visible_entries)
             # Down-weighted loss on visible entries (dense gradient signal)
-            loss_visible = loss_fn(pred_mean, pred_std, train_data.species_x_mean, train_data.species_x_std, visible_entries)
             loss = loss_masked + args.visible_loss_weight * loss_visible
         else:
-            loss = loss_fn(pred_mean, pred_std, train_data.species_x_mean, train_data.species_x_std, observed_mask)
+            loss = (
+                loss_fn(*predictions, *train_targets, observed_mask)
+                if args.trait_representation == 'mean_std'
+                else loss_fn(predictions, train_targets, observed_mask)
+            )
 
         # add graph smothness loss
-        gs_loss = graph_smoothness_loss(pred_mean, train_data.species_species_edge_index) * args.smoothness_weight
+        gs_loss = graph_smoothness_loss(predictions[0], train_data.species_species_edge_index) * args.smoothness_weight
         loss += gs_loss
         
         if torch.isnan(loss):
@@ -151,7 +170,8 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None):
 
         optimizer.step()
         if scheduler is not None:
-            scheduler.step() if args.scheduler != 'plateau' else scheduler.step(loss)
+            scheduler.step(loss) 
+            # if args.scheduler != 'plateau' else scheduler.step(loss)
 
         log_dict = {
             'train_loss': loss.item(), 
@@ -164,8 +184,14 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None):
         if epoch % args.test_logging_step == 0:
             model.eval()
             with torch.no_grad():
-                pred_mean, pred_std = model(test_data)
-                test_loss = loss_fn(pred_mean, pred_std, test_data.species_x_mean, test_data.species_x_std, ~test_data.traits_nanmask)
+                predictions = model(test_data)
+                test_targets = tuple(getattr(test_data, key) for key in trait_feature_keys)
+                test_mask = ~test_data.traits_nanmask
+                test_loss = (
+                    loss_fn(*predictions, *test_targets, test_mask)
+                    if args.trait_representation == 'mean_std'
+                    else loss_fn(predictions, test_targets, test_mask)
+                )
                 
                 # Compute additional metrics
                 # coverage = model.compute_coverage(
@@ -175,10 +201,11 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None):
 
                 # mean RMSE over masked entries (matching baseline)
                 mask_for_loss = ~test_data.traits_nanmask
-                mean_rmse = F.mse_loss(pred_mean[mask_for_loss], test_data.species_x_mean[mask_for_loss], reduction='mean').sqrt()
+                primary_prediction, primary_target = predictions[0], test_targets[0]
+                mean_rmse = F.mse_loss(primary_prediction[mask_for_loss], primary_target[mask_for_loss], reduction='mean').sqrt()
                 
 
-                correlation = compute_correlation(pred_mean, test_data.species_x_mean)
+                correlation = compute_correlation(primary_prediction, primary_target)
 
                 if test_loss.item() < best_test_loss:
                     best_test_loss = test_loss.item()
@@ -224,6 +251,12 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None):
         model.load_state_dict(best_model)
 
     # --- Full evaluation pipeline (Part 1 + Part 2) ---
+    # TODO: Create equivalent evaluation pipeline
+    if args.trait_representation != 'mean_std':
+        print('Skipping mean/std evaluation pipeline for min/max/range predictions.')
+        if args.use_wb:
+            wandb.finish()
+        return float('nan')
     gen_col_names = list(dataset.traits_gen.columns)
     print("Launching full evaluation pipeline...")
     model.eval()

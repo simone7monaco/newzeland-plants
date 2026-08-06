@@ -4,7 +4,6 @@ from torch import dist, dtype, nn
 import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 import pytorch_lightning as pl
-from loader import data_split
 from torch_geometric.utils import subgraph, bipartite_subgraph
 from torch_geometric.data import HeteroData
 import torch_geometric
@@ -62,9 +61,18 @@ class GNN(nn.Module):
 class TraitsPredictor(nn.Module):
     def __init__(self, in_traits, in_gen, in_phylo, in_space, hidden_channels, out_channels, 
                  num_layers, dropout=0.3, gnn_module='GATConv', eps=1e-6, mask_ratio=0.15, 
-                 mask_strategy='random', use_env_features=True, use_phylo_features=True):
+                 mask_strategy='random', use_env_features=True, use_phylo_features=True,
+                 trait_representation='min_max_range'):
         super(TraitsPredictor, self).__init__()
+        if trait_representation not in {'mean_std', 'min_max_range'}:
+            raise ValueError("trait_representation must be 'mean_std' or 'min_max_range'")
         gnn = getattr(pyg_nn, gnn_module)
+        self.trait_representation = trait_representation
+        self.trait_feature_keys = (
+            ('species_x_mean', 'species_x_std')
+            if trait_representation == 'mean_std'
+            else ('species_x_min', 'species_x_max', 'species_x_range')
+        )
         self.use_phylo_features = use_phylo_features
         effective_phylo = in_phylo if use_phylo_features else 0
 
@@ -75,13 +83,12 @@ class TraitsPredictor(nn.Module):
             # Species-side: considering using only non-target  inputs at that stage
             self.bipartite_conv = pyg_nn.GATConv((hidden_channels, in_gen + effective_phylo), hidden_channels, edge_dim=1, add_self_loops=False)
 
-        # mean_traits, std_traits, visibility_mask, gen_features, phylo_features
-        self.species_linear = nn.Linear(3*in_traits + in_gen + effective_phylo, hidden_channels)
+        # Trait values, visibility mask, genetic features, and phylogenetic features.
+        self.species_linear = nn.Linear((len(self.trait_feature_keys) + 1) * in_traits + in_gen + effective_phylo, hidden_channels)
         species_gnn_in = hidden_channels + hidden_channels if use_env_features else hidden_channels
         self.species_gnn = GNN(species_gnn_in, hidden_channels, hidden_channels, num_layers=num_layers, gnn=gnn, dropout=dropout)
         
-        # Predict mean and log_std separately (2 * out_channels)
-        self.fc = nn.Linear(hidden_channels, 2 * out_channels)
+        self.fc = nn.Linear(hidden_channels, len(self.trait_feature_keys) * out_channels)
         self.eps = eps  # Small constant for numerical stability
         self.mask_ratio = mask_ratio  # Fraction of observed traits to mask during training
         self.mask_strategy = mask_strategy  # 'random', 'blockwise', or 'balanced'
@@ -92,33 +99,33 @@ class TraitsPredictor(nn.Module):
         self.species_attention_weights = None
         self.reconstruction_mask = None
 
-    def compute_reconstruction_mask(self, species_mean, observed_mask):
+    def compute_reconstruction_mask(self, species_traits, observed_mask):
         reconstruction_mask = None
         if self.training and self.mask_ratio > 0:
             # Identify observed (non-NaN) trait entries
             
             if self.mask_strategy == 'blockwise':
                 # Mask entire traits (columns) to force cross-trait learning
-                n_traits = species_mean.size(1)
+                n_traits = species_traits.size(1)
                 n_traits_to_mask = max(1, int(n_traits * self.mask_ratio))
-                traits_to_mask = torch.randperm(n_traits)[:n_traits_to_mask].to(species_mean.device)
-                reconstruction_mask = torch.zeros_like(species_mean, dtype=torch.bool)
+                traits_to_mask = torch.randperm(n_traits)[:n_traits_to_mask].to(species_traits.device)
+                reconstruction_mask = torch.zeros_like(species_traits, dtype=torch.bool)
                 reconstruction_mask[:, traits_to_mask] = True
                 reconstruction_mask = reconstruction_mask & observed_mask
             elif self.mask_strategy == 'balanced':
                 # Ensure each trait is masked with similar frequency
-                reconstruction_mask = torch.zeros_like(species_mean, dtype=torch.bool)
-                for trait_idx in range(species_mean.size(1)):
+                reconstruction_mask = torch.zeros_like(species_traits, dtype=torch.bool)
+                for trait_idx in range(species_traits.size(1)):
                     trait_observed = observed_mask[:, trait_idx]
                     n_observed = trait_observed.sum()
                     if n_observed > 0:
                         n_to_mask = max(1, int(n_observed * self.mask_ratio))
                         observed_indices = torch.where(trait_observed)[0]
-                        mask_indices = observed_indices[torch.randperm(len(observed_indices))[:n_to_mask].to(species_mean.device)]
+                        mask_indices = observed_indices[torch.randperm(len(observed_indices))[:n_to_mask].to(species_traits.device)]
                         reconstruction_mask[mask_indices, trait_idx] = True
             else:  # 'random' (default)
                 # Randomly select observed entries to mask for reconstruction
-                reconstruction_mask = torch.rand_like(species_mean) < self.mask_ratio
+                reconstruction_mask = torch.rand_like(species_traits) < self.mask_ratio
                 reconstruction_mask = reconstruction_mask & observed_mask  # Only mask observed entries
         return reconstruction_mask
         
@@ -131,28 +138,25 @@ class TraitsPredictor(nn.Module):
         This prevents shortcut learning where the model just copies input traits to output.
         
         Returns:
-            If training: (pred_mean, pred_std, reconstruction_mask)
-                reconstruction_mask indicates which traits were masked and should be used for loss
-            If not training: (pred_mean, pred_std)
+            mean_std: (pred_mean, pred_std), where pred_std is positive.
+            min_max_range: (pred_min, pred_max, pred_range).
         """
         
-        # Create a copy of traits that may be masked during training
-        species_x_mean = data.species_x_mean.clone()
-        species_x_std = data.species_x_std.clone()
+        # Create copies of the active trait representation that may be masked during training.
+        species_traits = [getattr(data, key).clone() for key in self.trait_feature_keys]
 
         observed_mask = ~data.traits_nanmask  # Shape: (n_species, n_traits)
-        reconstruction_mask = self.compute_reconstruction_mask(data.species_x_mean, observed_mask)
+        reconstruction_mask = self.compute_reconstruction_mask(species_traits[0], observed_mask)
         if reconstruction_mask is not None:
             # Zero out masked entries in the input (sentinel value)
-            species_x_mean = species_x_mean * ~reconstruction_mask
-            species_x_std = species_x_std * ~reconstruction_mask
+            species_traits = [traits * ~reconstruction_mask for traits in species_traits]
             # Binary indicator: 1 where the model can see the true value, 0 where missing or masked
             visibility_mask = (observed_mask & ~reconstruction_mask).float()
         else:
             visibility_mask = observed_mask.float()
         
         phylo_feats = [data.species_x_phylo] if self.use_phylo_features else []
-        species_input = torch.cat([species_x_mean, species_x_std, visibility_mask, data.species_x_gen] + phylo_feats, dim=1)
+        species_input = torch.cat(species_traits + [visibility_mask, data.species_x_gen] + phylo_feats, dim=1)
         species_input = self.species_linear(species_input).relu()
         
         if self.use_env_features:
@@ -168,7 +172,7 @@ class TraitsPredictor(nn.Module):
             species_part = torch.cat([data.species_x_gen] + phylo_feats, dim=1)
             space_to_species = self.bipartite_conv((space_embeddings, species_part), data.spatial_species_edge_index,
                                 edge_attr=data.spatial_species_edge_attr,
-                                size=(space_embeddings.size(0), data.species_x_mean.size(0)),
+                                size=(space_embeddings.size(0), species_traits[0].size(0)),
                                 return_attention_weights=return_attention_weights)
             if return_attention_weights:
                 space_to_species, bip_attention_weights = space_to_species
@@ -186,15 +190,14 @@ class TraitsPredictor(nn.Module):
             self.species_attention_weights = species_attention_weights
         species_embeddings = species_embeddings.relu()
 
-        # Predict mean and log_std
-        mean_std = self.fc(species_embeddings)
-        mean, log_std = mean_std.chunk(2, dim=-1)
-        
-        # Apply softplus to log_std and add epsilon: sigma = softplus(log_std) + eps
-        std = F.softplus(log_std) + self.eps
+        predictions = self.fc(species_embeddings).chunk(len(self.trait_feature_keys), dim=-1)
+        if self.trait_representation == 'mean_std':
+            mean, log_std = predictions
+            # Apply softplus to log_std and add epsilon: sigma = softplus(log_std) + eps.
+            predictions = (mean, F.softplus(log_std) + self.eps)
              
         self.reconstruction_mask = reconstruction_mask
-        return mean, std
+        return predictions
 
     @staticmethod
     def compute_coverage(pred_mean, pred_std, target_mean, confidence_levels=[0.9, 0.95], nanmask=None):
@@ -234,7 +237,7 @@ class TraitsPredictor(nn.Module):
         return coverage
 
 
-"""
+r"""
 ### Per-trait loss reduction
 
 Both `DeterministicLoss` and `MixedNLLLoss` use:
@@ -293,6 +296,38 @@ class DeterministicLoss(nn.Module):
         else:
             loss_std = torch.zeros((), device=pred_mean.device)
         return loss_mean + loss_std
+
+
+class MultiTargetDeterministicLoss(nn.Module):
+    """Huber reconstruction loss for equally observed min/max/range targets."""
+    def __init__(self, reduction='mean', per_trait_reduction=True):
+        super().__init__()
+        self.reduction = reduction
+        self.per_trait_reduction = per_trait_reduction
+        self.cache = {}
+
+    def forward(self, predictions, targets, mask=None) -> torch.Tensor:
+        if len(predictions) != 3 or len(targets) != 3:
+            raise ValueError('min_max_range loss requires min, max, and range predictions and targets')
+        if mask is None:
+            mask = torch.ones_like(predictions[0], dtype=torch.bool)
+        if not mask.any():
+            raise ValueError('No valid entries to compute loss on.')
+
+        losses = [F.huber_loss(prediction, target, reduction='none') for prediction, target in zip(predictions, targets)]
+        self.cache = {
+            name: loss[mask].mean().item()
+            for name, loss in zip(('huber_min', 'huber_max', 'huber_range'), losses)
+        }
+        combined = sum(losses) / len(losses)
+        if self.reduction == 'sum':
+            return (combined * mask.float()).sum()
+        if not self.per_trait_reduction:
+            return (combined * mask.float()).sum() / mask.sum()
+        count_per_trait = mask.float().sum(dim=0)
+        active_traits = count_per_trait > 0
+        return ((combined * mask.float())[:, active_traits].sum(dim=0)
+                / count_per_trait[active_traits]).mean()
         
 class MixedNLLLoss(nn.Module):
     def __init__(self, distribution='lognormal', reduction='mean',
@@ -361,7 +396,7 @@ class MixedNLLLoss(nn.Module):
             huber_scalar = huber_vals[point_mask].mean()
 
         # ---- Distribution targets: KL divergence ----
-        if dist_mask.any():
+        if dist_mask.any() and target_std is not None:
             if self.distribution == "normal":
                 mu_p = pred_mean[dist_mask]
                 sig_p = pred_std[dist_mask].clamp_min(self.eps)

@@ -1,18 +1,30 @@
+import sys
+import warnings
 import numpy as np
 import xarray as xr
 from pathlib import Path
 from tqdm import tqdm
 import itertools
 import pandas as pd
+import re
 from Bio import Phylo
 import networkx as nx
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"pkg_resources is deprecated as an API.*",
+    category=UserWarning,
+    module=r"node2vec\.edges",
+)
+from node2vec import Node2Vec
 from sklearn.cluster import SpectralClustering
 from sklearn.model_selection import GroupKFold, KFold
 from scipy.stats import yeojohnson as _scipy_yeojohnson
 
 import torch
-import sys
-from torch_geometric.data import Data, HeteroData
+from torch_geometric.transforms import KNNGraph, BaseTransform
+from torch_geometric.data import Data, HeteroData, InMemoryDataset
+from torch_geometric.utils import from_networkx, subgraph, bipartite_subgraph
 
 
 def _yj_transform(x: np.ndarray, lmbda: float) -> np.ndarray:
@@ -47,33 +59,40 @@ def _yj_inverse(y: np.ndarray, lmbda: float) -> np.ndarray:
     else:
         out[neg] = 1.0 - np.power(np.clip(-(2.0 - lam) * y[neg] + 1.0, 0.0, None), 1.0 / (2.0 - lam))
     return out
-from torch_geometric.transforms import KNNGraph, BaseTransform
-from torch_geometric.utils import from_networkx
-from torch_geometric.data import InMemoryDataset
-from torch_geometric.utils import subgraph, bipartite_subgraph
 
 
 class NormalizeFeatures(BaseTransform):
     r"""Normalizes graph attributes; traits can use per-column Yeo-Johnson + z, others use z or sin/cos."""
-    def __init__(self, trait_norm_mean='yj', trait_norm_std='z'):
+    def __init__(self, trait_norm_mean='yj', trait_norm_std='z',
+                 trait_norm_min='yj', trait_norm_max='yj', trait_norm_range='yj'):
+
         self.normalizations = {
             'spatial_x': 'sincos', # They are latitude and longitude
             'spatial_global_data': 'z',
-            'species_x_mean': trait_norm_mean,
             'species_x_gen': 'z',
+            'species_x_mean': trait_norm_mean,
             'species_x_std': trait_norm_std,
+            'species_x_min': trait_norm_min,
+            'species_x_max': trait_norm_max,
+            'species_x_range': trait_norm_range,
             'species_x_phylo': None, # x_phylo is a vector of embeddings, so no normalization
             'spatial_spatial_edge_attr': 'z',
             'species_species_edge_attr': 'z',
             'spatial_species_edge_attr': 'z',
         }
         self.props = {}
+        self.trait_attributes = {
+            'species_x_mean', 'species_x_std', 'species_x_min',
+            'species_x_max', 'species_x_range',
+        }
 
     def fit(self, data: Data, eps: float = 1e-6):
         if getattr(data, 'props', False):
             print("Warning: Data already has props, overwriting\n")
 
         for k_norm in self.normalizations:
+            if k_norm not in data:
+                continue
             if self.normalizations[k_norm] == 'yj':
                 # Per-column Yeo-Johnson fit (lambda) + post-transform z-statistics.
                 # Masked/missing entries (traits_nanmask) are excluded from fitting.
@@ -84,16 +103,17 @@ class NormalizeFeatures(BaseTransform):
                 post_std = np.ones(n_traits, dtype=np.float64)
                 nan_mask_np = (
                     data.traits_nanmask.numpy()
-                    if (hasattr(data, 'traits_nanmask') and k_norm in ['species_x_mean', 'species_x_std'])
+                    if (hasattr(data, 'traits_nanmask') and k_norm in self.trait_attributes)
                     else np.zeros_like(data_np, dtype=bool)
                 )
                 for j in range(n_traits):
                     valid = data_np[~nan_mask_np[:, j], j]
                     if len(valid) >= 2:
                         transformed, lam = _scipy_yeojohnson(valid)
+                        transformed_array = np.asarray(transformed, dtype=np.float64)
                         lambdas[j] = lam
-                        post_mean[j] = transformed.mean()
-                        s = transformed.std()
+                        post_mean[j] = np.mean(transformed_array)
+                        s = np.std(transformed_array)
                         post_std[j] = s if s > eps else 1.0
                 self.props[k_norm] = {
                     'lambdas': torch.tensor(lambdas, dtype=torch.float32),
@@ -128,9 +148,11 @@ class NormalizeFeatures(BaseTransform):
         if not self.props:
             print("Warning: No props found, computing on the fly (this may cause data leakage if done on the whole dataset instead of just the training set)\n")
             self.fit(data, eps)
-        
+
         setattr(data, 'normalized', True)
         for k_norm in self.normalizations:
+            if k_norm not in data:
+                continue
             if self.normalizations[k_norm] == 'sincos':
                 data[k_norm] = data[k_norm] * np.pi / 180
                 data[k_norm] = torch.stack([torch.sin(data[k_norm][:, 0]), torch.cos(data[k_norm][:, 0]),
@@ -151,7 +173,7 @@ class NormalizeFeatures(BaseTransform):
                 pass
             else:
                 raise ValueError(f"Unknown normalization: {self.normalizations[k_norm]}")
-            if k_norm in ['species_x_mean', 'species_x_std']:
+            if k_norm in self.trait_attributes:
                 # Zero out masked entries so they equal the mean (0) in normalized space
                 data[k_norm] = data[k_norm] * ~data.traits_nanmask
         return data
@@ -181,13 +203,13 @@ class NormalizeFeatures(BaseTransform):
                 for j in range(data_np.shape[1]):
                     data_np[:, j] = _yj_inverse(data_np[:, j], lambdas[j])
                 data[k_norm] = torch.tensor(data_np, dtype=data[k_norm].dtype)
-                if soft_clip and k_norm == 'species_x_mean':
+                if soft_clip and k_norm in {'species_x_mean', 'species_x_min', 'species_x_max'}:
                     data[k_norm] = soft_clip_lower + torch.nn.functional.softplus(data[k_norm] - soft_clip_lower)
             elif self.normalizations[k_norm] in ['logz', 'z']:
                 data[k_norm] = data[k_norm] * self.props[k_norm]['std'] + self.props[k_norm]['mean']
                 if self.normalizations[k_norm] == 'logz':
                     data[k_norm] = torch.exp(data[k_norm]) - 1e-6
-                if soft_clip and k_norm == 'species_x_mean':
+                if soft_clip and k_norm in {'species_x_mean', 'species_x_min', 'species_x_max'}:
                     data[k_norm] = soft_clip_lower + torch.nn.functional.softplus(data[k_norm] - soft_clip_lower)
         return data
     
@@ -208,10 +230,15 @@ if '__main__' in sys.modules:
 torch.serialization.add_safe_globals([NZData])
 
 class PlantDataset(InMemoryDataset):
-    def __init__(self, root, transform=None, pre_transform=None, pre_filter=None):
-        self.get_traits_df(root)
-        self.y_index = np.arange(len(self.traits_mean.columns))
-
+    def __init__(self, root, transform=None, pre_transform=None, pre_filter=None,
+                 trait_representation='min_max_range', traits_filename='Traits.xlsx'):
+        self.trait_representation = trait_representation
+        self.pivot_feature = 'traits_mean' if self.trait_representation == 'mean_std' else 'traits_min'
+        self.traits_filename = traits_filename
+        self.get_traits_df(root, trait_representation=trait_representation)
+        self.trait_names = list(getattr(self, self.pivot_feature).columns)
+        self.y_index = np.arange(len(self.trait_names))
+            
         super().__init__(root, transform, pre_transform, pre_filter)
         self.load(self.processed_paths[0])
     
@@ -224,51 +251,167 @@ class PlantDataset(InMemoryDataset):
         return raster
     
     
-    def get_traits_df(self, root, dummy_threshold=0.05, drop_threshold=0.7):
-        def process_trait_col_name(name):
-            return name.strip().replace('mean', '').replace('Var', '')
-        
-        if 'Mean' in pd.ExcelFile(root / 'Traits.xlsx').sheet_names:
-            self.traits_mean = pd.read_excel(root / 'Traits.xlsx', sheet_name='Mean').set_index('Species')
-            gen_cols = self.traits_mean.select_dtypes(include=['object']).columns.union(['Hybridisation'])
-            self.traits_std = pd.read_excel(root / 'Traits.xlsx', sheet_name='Variance').drop(columns=gen_cols).set_index('Species')
-            
+    def get_traits_df(self, root, dummy_threshold=0.05, drop_threshold=0.7,
+                      trait_representation='min_max_range'):
+        if trait_representation not in {'mean_std', 'min_max_range'}:
+            raise ValueError("trait_representation must be 'mean_std' or 'min_max_range'")
+
+        traits_path = root / self.traits_filename
+        if not traits_path.exists():
+            raise RuntimeError(f'{self.traits_filename} not found at {traits_path}')
+        sheets = pd.read_excel(traits_path, sheet_name=None)
+        candidates = [
+            frame for frame in sheets.values()
+            if 'Species' in frame.columns and any(
+                re.match(r'^.*?(Mean|Std|Var|Min|Max|Range)$', str(column), flags=re.IGNORECASE)
+                for column in frame.columns
+            )
+        ]
+        if not candidates:
+            raise RuntimeError(
+                f'{self.traits_filename} must contain a sheet with a Species column and numerical trait columns '
+                'named Varname{Mean|Std|Var|Min|Max|Range}.'
+            )
+        seen_categorical = set()
+        unique_candidates = []
+        for frame in candidates:
+            columns_to_keep = ['Species']
+            for column in frame.columns:
+                if column == 'Species':
+                    continue
+                is_trait_column = re.match(
+                    r'^.*?(Mean|Std|Var|Min|Max|Range)$', str(column), flags=re.IGNORECASE
+                )
+                if is_trait_column or column not in seen_categorical:
+                    columns_to_keep.append(column)
+                if not is_trait_column:
+                    seen_categorical.add(column)
+            unique_candidates.append(frame[columns_to_keep])
+        trait_values = pd.concat(
+            [frame.set_index('Species') for frame in unique_candidates], axis=1
+        )
+        trait_columns = {}
+        categorical_columns = []
+        for column in trait_values.columns:
+            match = re.match(r'^(.*?)(Mean|Std|Var|Min|Max|Range)$', str(column), flags=re.IGNORECASE)
+            if not match:
+                categorical_columns.append(column)
+                continue
+            trait_name, statistic = match.groups()
+            trait_name = trait_name.strip()
+            statistic = statistic.lower()
+            if not trait_name:
+                raise RuntimeError(f'Invalid trait column name: {column}')
+            if statistic in trait_columns.setdefault(trait_name, {}):
+                raise RuntimeError(f'Duplicate {statistic} column for trait {trait_name}')
+            trait_columns[trait_name][statistic] = column
+
+        categorical_columns = list(dict.fromkeys(categorical_columns))
+        gen_cols = categorical_columns
+        self.traits_gen = trait_values[categorical_columns]
+        if trait_representation == 'mean_std':
+            selected_traits = {
+                trait_name: columns for trait_name, columns in trait_columns.items()
+                if 'mean' in columns
+            }
+            missing_spread = [
+                trait_name for trait_name, columns in selected_traits.items()
+                if not {'std', 'var'}.intersection(columns)
+            ]
+            if not selected_traits or missing_spread:
+                raise RuntimeError(
+                    f'{self.traits_filename} must contain a sheet with a Species column and numerical trait columns '
+                    f'named VarnameMean and either VarnameStd or VarnameVar. '
+                    f'Missing spread columns: {missing_spread}'
+                )
+            self.traits_mean = pd.DataFrame({
+                trait_name: trait_values[columns['mean']]
+                for trait_name, columns in selected_traits.items()
+            }, index=trait_values.index)
+            self.traits_std = pd.DataFrame({
+                trait_name: trait_values[columns['std']]
+                if 'std' in columns else np.sqrt(trait_values[columns['var']])
+                for trait_name, columns in selected_traits.items()
+            }, index=trait_values.index)
         else:
-            raise RuntimeError('Traits.xlsx file with Mean and Variance sheets not found.')
-        self.traits_gen = self.traits_mean[gen_cols]
-        self.traits_mean = self.traits_mean.drop(columns=gen_cols)
-        self.traits_mean = self.traits_mean.rename(columns=process_trait_col_name)
-        
-        # convert to St dev
-        self.traits_std = self.traits_std.apply(np.sqrt).rename(columns=process_trait_col_name)
+            selected_traits = {
+                trait_name: columns for trait_name, columns in trait_columns.items()
+                if 'min' in columns or 'max' in columns or 'range' in columns
+            }
+            missing_bounds = [
+                trait_name for trait_name, columns in selected_traits.items()
+                if not {'min', 'max'}.issubset(columns)
+            ]
+            if not selected_traits or missing_bounds:
+                raise RuntimeError(
+                    f'{self.traits_filename} must contain a sheet with a Species column and numerical trait columns '
+                    f'named VarnameMin and VarnameMax; VarnameRange is optional. '
+                    f'Missing bound columns: {missing_bounds}'
+                )
+            self.traits_min = pd.DataFrame({
+                trait_name: trait_values[columns['min']]
+                for trait_name, columns in selected_traits.items()
+            }, index=trait_values.index)
+            self.traits_max = pd.DataFrame({
+                trait_name: trait_values[columns['max']]
+                for trait_name, columns in selected_traits.items()
+            }, index=trait_values.index)
+            calculated_range = self.traits_max - self.traits_min
+            print("Warning: Some traits are missing 'Range' columns; calculated from Min/Max.")
+            self.traits_range = pd.DataFrame({
+                trait_name: trait_values[columns['range']]
+                if 'range' in columns else calculated_range[trait_name]
+                for trait_name, columns in selected_traits.items()
+            }, index=trait_values.index)
+            # self.traits_mean = (self.traits_min + self.traits_max) / 2
+            # self.traits_std = self.traits_range / np.sqrt(12.0)
 
         # remove columns with more than drop_threshold missing values
-        self.traits_mean = self.traits_mean.drop(columns=self.traits_mean.columns[(self.traits_mean.isna().sum() / len(self.traits_mean)) > drop_threshold])
-        for col in self.traits_mean.columns.difference(self.traits_std.columns):
-            self.traits_std[col] = np.nan
-        self.traits_std = self.traits_std[self.traits_mean.columns]
+        for df in [getattr(self, attr) for attr in ['traits_mean', 'traits_std', 'traits_min', 'traits_max', 'traits_range'] if hasattr(self, attr)]:
+            df.drop(columns=df.columns[(df.isna().sum() / len(df)) > drop_threshold], inplace=True)
 
         for cl_feat in gen_cols:
             for cl in self.traits_gen[cl_feat].unique():
                 if self.traits_gen[cl_feat].eq(cl).sum() < len(self.traits_gen) * dummy_threshold and not pd.isna(cl):
                     self.traits_gen[cl_feat] = self.traits_gen[cl_feat].replace({cl: 'Other'})
         self.traits_gen = pd.get_dummies(self.traits_gen, drop_first=True)
-        return self.traits_mean, self.traits_std, self.traits_gen
+
+        if self.trait_representation == 'mean_std':
+            for col in self.traits_mean.columns.difference(self.traits_std.columns):
+                self.traits_std[col] = np.nan
+            self.traits_std = self.traits_std[self.traits_mean.columns]
+            return (self.traits_mean, self.traits_std), self.traits_gen
+        else:
+            return (self.traits_min, self.traits_max, self.traits_range), self.traits_gen
 
     @property
     def raw_dir(self):
         return Path(self.root) / 'Distribution layers'
     
-    @property
-    def raw_file_names(self):
-        dist_files = [f'{f}_distribution.tif' for f in self.traits_mean.index]
+    def get_raw_file_names(self):
+        dist_files = [f'{f}_distribution.tif' for f in getattr(self, self.pivot_feature).index]
         return dist_files
 
     @property
-    def processed_file_names(self):
-        return ['heterodata.pt']
+    def raw_file_names(self):
+        return self.get_raw_file_names
 
-    def download(self):
+    @property
+    def raw_paths(self):
+        return [str(self.raw_dir / filename) for filename in self.get_raw_file_names()]
+
+    def get_processed_file_names(self):
+        return [f'heterodata_{self.trait_representation}.pt']
+
+    @property
+    def processed_file_names(self):
+        return self.get_processed_file_names
+
+    @property
+    def processed_paths(self):
+        return [str(Path(self.processed_dir) / filename) for filename in self.get_processed_file_names()]
+
+    def _download(self):
         raise RuntimeError('Dataset not found.')
 
     def load_complete(self, data_path):
@@ -307,7 +450,6 @@ class PlantDataset(InMemoryDataset):
                     child.name = f"temp_{id(child)}"
                 G.add_edge(clade.name, child.name, weight=child.branch_length)
         
-        from node2vec import Node2Vec
         node2vec = Node2Vec(G, dimensions=16, walk_length=30, num_walks=200, workers=4)
         model = node2vec.fit(window=10, min_count=1, batch_words=4)
 
@@ -329,7 +471,7 @@ class PlantDataset(InMemoryDataset):
         edges_to_remove = [(u, v) for u, v, d in G_species.edges(data=True) if d["weight"] > sym_threshold]
         G_species.remove_edges_from(edges_to_remove)
 
-        G_species.remove_nodes_from(list(set(G_species.nodes).difference(self.traits_mean.index)))
+        G_species.remove_nodes_from(list(set(G_species.nodes).difference(getattr(self, self.pivot_feature).index)))
 
         for node in G_species.nodes():
             G_species.nodes[node]["x"] = node_embeddings[node]
@@ -337,21 +479,24 @@ class PlantDataset(InMemoryDataset):
         self.species_graph.node_names = [n for n in G_species.nodes()]  # Map node names to indices
 
         # Add nodes not present in the ph_tree
-        for node in self.traits_mean.index.difference(self.species_graph.node_names):
+        for node in getattr(self, self.pivot_feature).index.difference(self.species_graph.node_names):
             self.species_graph.node_names.append(node)
             self.species_graph.x = torch.cat([self.species_graph.x, torch.zeros(1, self.species_graph.num_features)], dim=0)
 
-        self.species_graph.traits_nanmask = torch.tensor(self.traits_mean.loc[self.species_graph.node_names].isna().values, dtype=torch.bool)
-        traits_nanmask_std = torch.tensor(self.traits_std.loc[self.species_graph.node_names].isna().values, dtype=torch.bool)
-        # assert no non-nan std is nan in mean
-        assert torch.all((~traits_nanmask_std) <= (~self.species_graph.traits_nanmask))
+        self.species_graph.traits_nanmask = torch.tensor(getattr(self, self.pivot_feature).loc[self.species_graph.node_names].isna().values, dtype=torch.bool)
+        for attr in ['traits_mean', 'traits_std', 'traits_min', 'traits_max', 'traits_range']:
+            if hasattr(self, attr):
+                other_nanmask = torch.tensor(getattr(self, attr).loc[self.species_graph.node_names].isna().values, dtype=torch.bool)
+                assert torch.all((~other_nanmask) <= (~self.species_graph.traits_nanmask)), f"Non-nan values in {attr} should not be nan in {self.pivot_feature}"
+                setattr(self, attr, getattr(self, attr).loc[self.species_graph.node_names])
+                setattr(self.species_graph, attr, torch.tensor(getattr(self, attr).fillna(0).astype(np.float32).values))
 
-        self.traits_mean = self.traits_mean.loc[self.species_graph.node_names]
-        self.traits_std = self.traits_std.loc[self.species_graph.node_names]
+        setattr(self, self.pivot_feature, getattr(self, self.pivot_feature).loc[self.species_graph.node_names])
+        setattr(self.species_graph, self.pivot_feature, torch.tensor(getattr(self, self.pivot_feature).fillna(0).astype(np.float32).values))
+        
         self.traits_gen = self.traits_gen.loc[self.species_graph.node_names]
-        self.species_graph.traits_mean = torch.tensor(self.traits_mean.fillna(0).astype(np.float32).values)
-        self.species_graph.traits_std = torch.tensor(self.traits_std.fillna(0).astype(np.float32).values)
         self.species_graph.x_gen = torch.tensor(self.traits_gen.astype(np.float32).values)
+
         return self.species_graph
 
     def get_spatial_graph(self, n_clusters=50, k=6):
@@ -379,7 +524,7 @@ class PlantDataset(InMemoryDataset):
         # TODO: Ablation studies 
         species_graph = self.get_species_graph()
         spatial_graph = self.get_spatial_graph()
-        clim_rasters = self.load_complete('climatic layers')
+        clim_rasters = self.load_complete('Climatic layers')
         population_elevation_rasters = self.load_complete('population density and elevation layer')
         soil_rasters = self.load_complete('Soil NZ layers')
 
@@ -389,7 +534,8 @@ class PlantDataset(InMemoryDataset):
             index_space_specie = pd.read_csv(index_space_specie_path)
         else:
             index_space_specie = pd.DataFrame()
-            for f in tqdm(self.raw_paths, desc='Processing distribution layers'):
+            raw_paths = [self.raw_dir / filename for filename in self.get_raw_file_names()]
+            for f in tqdm(raw_paths, desc='Processing distribution layers'):
                 raster = self.load_raster(f)
                 species_name = Path(f).stem.rsplit('_', 1)[0]
                 # raster = raster.sel(x=space_df.x.values, y=space_df.y.values, method='nearest')
@@ -407,27 +553,35 @@ class PlantDataset(InMemoryDataset):
         bip_edge_index = torch.tensor(index_space_specie[['cluster', 'species_idx']].values.T, dtype=torch.long)
         bip_edge_attr = torch.tensor(index_space_specie.occurrence.values, dtype=torch.float32).unsqueeze(1)
 
-        data_all = NZData(
-        species_x_mean=species_graph.traits_mean,
-        species_x_std=species_graph.traits_std,
-        species_x_gen=species_graph.x_gen,
-        species_names=species_graph.node_names,
-        species_x_phylo=species_graph.x,
-        traits_nanmask=species_graph.traits_nanmask,
-        spatial_x=spatial_graph.pos,
-        spatial_pos=spatial_graph.pos, # repeated to stay un-normalized
-        spatial_global_data=torch.tensor(self.global_data.values, dtype=torch.float32),
-        species_species_edge_index=species_graph.edge_index,
-        species_species_edge_attr=species_graph.weight,
-        spatial_spatial_edge_index=spatial_graph.edge_index,
-        spatial_spatial_edge_attr=spatial_graph.edge_attr,
-        spatial_species_edge_index=bip_edge_index,
-        spatial_species_edge_attr=bip_edge_attr,
-        species_num_nodes=species_graph.num_nodes,
-        spatial_num_nodes=spatial_graph.num_nodes,
-        num_nodes=species_graph.num_nodes + spatial_graph.num_nodes,
-        features_names=self.traits_mean.columns.tolist()
+        if self.trait_representation == 'min_max_range':
+            data_all = NZData(
+                species_x_min=species_graph.traits_min,
+                species_x_max=species_graph.traits_max,
+                species_x_range=species_graph.traits_range
+            )
+        else:
+            data_all = NZData(
+                species_x_mean=species_graph.traits_mean,
+                species_x_std=species_graph.traits_std,
         )
+        data_all.species_x_gen = species_graph.x_gen
+        data_all.species_names = species_graph.node_names
+        data_all.species_x_phylo = species_graph.x
+        data_all.traits_nanmask = species_graph.traits_nanmask
+        data_all.spatial_x = spatial_graph.pos
+        data_all.spatial_pos = spatial_graph.pos # repeated to stay un-normalized
+        data_all.spatial_global_data = torch.tensor(self.global_data.values, dtype=torch.float32)
+        data_all.species_species_edge_index = species_graph.edge_index
+        data_all.species_species_edge_attr = species_graph.weight
+        data_all.spatial_spatial_edge_index = spatial_graph.edge_index
+        data_all.spatial_spatial_edge_attr = spatial_graph.edge_attr
+        data_all.spatial_species_edge_index = bip_edge_index
+        data_all.spatial_species_edge_attr = bip_edge_attr
+        data_all.species_num_nodes = species_graph.num_nodes
+        data_all.spatial_num_nodes = spatial_graph.num_nodes
+        data_all.num_nodes = species_graph.num_nodes + spatial_graph.num_nodes
+        data_all.features_names = getattr(self, self.pivot_feature).columns.tolist()
+
         self.save([data_all], self.processed_paths[0])
     
     def __getitem__(self, idx):
@@ -474,7 +628,9 @@ def data_split(data, test_size=0.3, k=0, seed=42):
 
     train_data = data.clone()
     test_data = data.clone()
-    for attr in ['x_mean', 'x_std', 'x_gen', 'x_phylo',]:
+    for attr in ['x_mean', 'x_std', 'x_min', 'x_max', 'x_range', 'x_gen', 'x_phylo']:
+        if f'species_{attr}' not in data:
+            continue
         train_data[f'species_{attr}'] = train_data[f'species_{attr}'][train_mask]
         test_data[f'species_{attr}'] = test_data[f'species_{attr}'][test_mask]
     train_data.traits_nanmask = train_data.traits_nanmask[train_mask]

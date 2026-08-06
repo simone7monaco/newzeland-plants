@@ -142,9 +142,10 @@ def impute_with_sklearn(imputer_name, df_values, mask_df):
     return imputed_df
 
 normalize_df = lambda df: pd.DataFrame(StandardScaler().fit_transform(df), index=df.index, columns=df.columns)
-def run_baseline(data_path: str, mask_ratio=0.15, mask_strategy='random', imputers=None):
+def run_baseline(data_path: str, mask_ratio=0.15, mask_strategy='random', imputers=None, trait_representation='mean_std'):
     imputers = imputers or ['mean', 'median']
-    dataset = PlantDataset(Path(data_path))
+    traits_filename = 'Traits.xlsx' if trait_representation == 'mean_std' else 'FernMinMax.xlsx'
+    dataset = PlantDataset(Path(data_path), traits_filename=traits_filename, trait_representation=trait_representation)
     traits_mean_df = normalize_df(dataset.traits_mean)
     traits_std_df = normalize_df(dataset.traits_std)
     traits_std_df = traits_std_df.loc[traits_mean_df.index, traits_mean_df.columns]
@@ -207,10 +208,11 @@ def get_args():
     parser.add_argument('--mask_ratio', type=float, default=0.15)
     parser.add_argument('--mask_strategy', type=str, default='random', choices=['random', 'blockwise', 'balanced'])
     parser.add_argument('--imputers', type=str, default='mean,median,knn', help='Comma-separated list of imputers')
+    parser.add_argument('--trait_representation', type=str, default='min_max_range', choices=['mean_std', 'min_max_range'], help='Trait representation to use (mean/std or min/max/range)')
     return parser.parse_args()
 
 
 if __name__ == '__main__':
     args = get_args()
     imputers = [i.strip() for i in args.imputers.split(',') if i.strip()]
-    run_baseline(args.data, mask_ratio=args.mask_ratio, mask_strategy=args.mask_strategy, imputers=imputers)
+    run_baseline(args.data, mask_ratio=args.mask_ratio, mask_strategy=args.mask_strategy, imputers=imputers, trait_representation=args.trait_representation)
