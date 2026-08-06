@@ -55,7 +55,7 @@ def get_args():
     parser.add_argument('--dropout', type=float, default=0.4, help='Dropout rate for the GNN')
     parser.add_argument('--scheduler', type=str, default='cosine', help='Learning rate scheduler type', choices=[None, 'plateau', 'cosine', 'step'])
 
-    parser.add_argument('--loss', type=str, default='dist_normal', choices=['deterministic', 'dist_normal', 'dist_lognormal'], help='Output distribution type')
+    parser.add_argument('--loss', type=str, default='deterministic', choices=['deterministic', 'dist_normal', 'dist_lognormal'], help='Output distribution type')
     parser.add_argument('--mask_ratio', type=float, default=0.15, help='Masking ratio for input features at training time')
     parser.add_argument('--kl_weight', type=float, default=1.0, help='Weight for the KL divergence loss term')
     parser.add_argument('--smoothness_weight', type=float, default=0.0, help='Weight for the graph smoothness loss')
@@ -170,8 +170,7 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
 
         optimizer.step()
         if scheduler is not None:
-            scheduler.step(loss) 
-            # if args.scheduler != 'plateau' else scheduler.step(loss)
+            scheduler.step(None) if args.scheduler != 'plateau' else scheduler.step(loss)  # type: ignore
 
         log_dict = {
             'train_loss': loss.item(), 
@@ -251,12 +250,6 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
         model.load_state_dict(best_model)
 
     # --- Full evaluation pipeline (Part 1 + Part 2) ---
-    # TODO: Create equivalent evaluation pipeline
-    if args.trait_representation != 'mean_std':
-        print('Skipping mean/std evaluation pipeline for min/max/range predictions.')
-        if args.use_wb:
-            wandb.finish()
-        return float('nan')
     gen_col_names = list(dataset.traits_gen.columns)
     print("Launching full evaluation pipeline...")
     model.eval()
@@ -364,9 +357,13 @@ if __name__ == "__main__":
 
         # Finally, concatenate all csv files in results/fold_*/ {attributions_spatial, attributions_species, predictions_mean, predictions_std} into single csv files in results/ for easier analysis
         tester.save_merged_original_predictions(args.output_dir)
-        for file_type in ['attributions_spatial', 'attributions_species', 'predictions_mean', 'predictions_std']:
-            if not args.use_env_features and file_type == 'attributions_spatial':
-                continue
+        prediction_file_types = ['predictions_mean', 'predictions_std'] if args.trait_representation == 'mean_std' else ['predictions_min', 'predictions_max', 'predictions_range']
+        if args.compute_xai:
+            prediction_file_types += ['attributions_species']
+            if args.use_env_features:
+                prediction_file_types += ['attributions_spatial']
+
+        for file_type in prediction_file_types:
             df_cat = pd.concat([pd.read_csv(subdir / f"{file_type}.csv") for subdir in args.output_dir.glob('fold_*')], ignore_index=True)
             df_cat.to_csv(args.output_dir / f"{file_type}_all.csv", index=False)
             print(f"Saved concatenated {file_type} to {args.output_dir / f'{file_type}_all.csv'}")

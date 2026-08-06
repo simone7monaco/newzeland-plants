@@ -13,7 +13,6 @@ dependencies = [
     "node2vec>=0.4.3",
     "openpyxl>=3.1.5",
     "optuna>=4.9.0",
-    "pip>=26.2",
     "pyyaml>=6.0.3",
     "rioxarray>=0.23.0",
     "scikit-learn>=1.9.0",
@@ -25,35 +24,26 @@ dependencies = [
     "pyg-lib==0.8.0",
     "torch-scatter==2.1.2",
     "torch-sparse==0.6.18",
-
     "wandb>=0.28.1",
-    "setuptools<81"
+    "setuptools<81",
+    "captum>=0.9.0",
 ]
 
 [tool.uv.sources]
-# torch = { index = "pytorch-cu130" }
-# pyg-lib = { index = "pyg-torch212-cu130" }
-# torch-scatter = { index = "pyg-torch212-cu130" }
-# torch-sparse = { index = "pyg-torch212-cu130" }
-
-torch = { index = "pytorch-cpu" }
-pyg-lib = { index = "pyg-torch212-cpu" }
-torch-scatter = { index = "pyg-torch212-cpu" }
-torch-sparse = { index = "pyg-torch212-cpu" }
+torch = { index = "pytorch-cu130" }
+pyg-lib = { index = "pyg-torch212-cu130" }
+torch-scatter = { index = "pyg-torch212-cu130" }
+torch-sparse = { index = "pyg-torch212-cu130" }
 
 # Official PyTorch CUDA 13.0 index.
 [[tool.uv.index]]
-# name = "pytorch-cu130"
-# url = "https://download.pytorch.org/whl/cu130"
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 # PyG's pip-style `-f` wheel page, represented as a uv flat index.
 [[tool.uv.index]]
-# name = "pyg-torch212-cu130"
-# url = "https://data.pyg.org/whl/torch-2.12.0+cu130.html"
-name = "pyg-torch212-cpu"
-url = "https://data.pyg.org/whl/torch-2.12.0+cpu.html"
+name = "pyg-torch212-cu130"
+url = "https://data.pyg.org/whl/torch-2.12.0+cu130.html"
 format = "flat"
 explicit = true

@@ -371,7 +371,7 @@ class PlantDataset(InMemoryDataset):
             df.drop(columns=df.columns[(df.isna().sum() / len(df)) > drop_threshold], inplace=True)
 
         for cl_feat in gen_cols:
-            for cl in self.traits_gen[cl_feat].unique():
+            for cl in self.traits_gen[cl_feat].unique(): # type: ignore
                 if self.traits_gen[cl_feat].eq(cl).sum() < len(self.traits_gen) * dummy_threshold and not pd.isna(cl):
                     self.traits_gen[cl_feat] = self.traits_gen[cl_feat].replace({cl: 'Other'})
         self.traits_gen = pd.get_dummies(self.traits_gen, drop_first=True)
