@@ -317,8 +317,9 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
     calibration_truth_data.traits_nanmask = calibration_truth_data.traits_nanmask & ~validation_mask.cpu()
     for trait_feature_key, target in zip(trait_feature_keys, validation_targets, strict=True):
         setattr(calibration_truth_data, trait_feature_key, target.cpu())
+
+    calibration_data = validation_data.clone().cpu()
     if args.trait_representation == 'mean_std':
-        calibration_data = validation_data.clone().cpu()
         calibration_data.species_x_mean = calibration_predictions[0].cpu()
         calibration_data.species_x_std = calibration_predictions[1].cpu()
         calibration_unnormalized = norm_transform.inverse(calibration_data, warn=False, soft_clip=True)
@@ -331,7 +332,6 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
             trait_names,
         )
     else:
-        calibration_data = validation_data.clone().cpu()
         calibration_data.species_x_min = calibration_predictions[0].cpu()
         calibration_data.species_x_max = calibration_predictions[1].cpu()
         calibration_data.species_x_range = calibration_predictions[2].cpu()
