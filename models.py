@@ -62,17 +62,15 @@ class TraitsPredictor(nn.Module):
     def __init__(self, in_traits, in_gen, in_phylo, in_space, hidden_channels, out_channels, 
                  num_layers, dropout=0.3, gnn_module='GATConv', eps=1e-6, mask_ratio=0.15, 
                  mask_strategy='random', use_env_features=True, use_phylo_features=True,
-                 trait_representation='min_max_range'):
+                 trait_feature_keys=('species_x_min', 'species_x_max', 'species_x_range')):
         super(TraitsPredictor, self).__init__()
-        if trait_representation not in {'mean_std', 'min_max_range'}:
-            raise ValueError("trait_representation must be 'mean_std' or 'min_max_range'")
+
         gnn = getattr(pyg_nn, gnn_module)
-        self.trait_representation = trait_representation
-        self.trait_feature_keys = (
-            ('species_x_mean', 'species_x_std')
-            if trait_representation == 'mean_std'
-            else ('species_x_min', 'species_x_max', 'species_x_range')
-        )
+        self.trait_feature_keys = trait_feature_keys
+
+        # if trait_representation == 'mean_std'
+        # self.trait_feature_keys = ('species_x_mean', 'species_x_std')
+
         self.use_phylo_features = use_phylo_features
         effective_phylo = in_phylo if use_phylo_features else 0
 
@@ -86,9 +84,21 @@ class TraitsPredictor(nn.Module):
         # Trait values, visibility mask, genetic features, and phylogenetic features.
         self.species_linear = nn.Linear((len(self.trait_feature_keys) + 1) * in_traits + in_gen + effective_phylo, hidden_channels)
         species_gnn_in = hidden_channels + hidden_channels if use_env_features else hidden_channels
-        self.species_gnn = GNN(species_gnn_in, hidden_channels, hidden_channels, num_layers=num_layers, gnn=gnn, dropout=dropout)
+        self.species_gnn = GNN(
+            species_gnn_in,
+            hidden_channels,
+            hidden_channels,
+            num_layers=num_layers,
+            gnn=gnn,
+            dropout=dropout,
+            check_oversmoothing=use_phylo_features,
+        )
         
         self.fc = nn.Linear(hidden_channels, len(self.trait_feature_keys) * out_channels)
+        # Targets are centered by fold-specific normalization, so a zero output
+        # starts at the training-fold mean and avoids explosive YJ inverses.
+        nn.init.zeros_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
         self.eps = eps  # Small constant for numerical stability
         self.mask_ratio = mask_ratio  # Fraction of observed traits to mask during training
         self.mask_strategy = mask_strategy  # 'random', 'blockwise', or 'balanced'
@@ -98,6 +108,21 @@ class TraitsPredictor(nn.Module):
         self.bip_attention_weights = None
         self.species_attention_weights = None
         self.reconstruction_mask = None
+
+    def _species_graph_inputs(self, data, n_species_nodes):
+        """Return phylogenetic edges, or self-loops when phylogeny is disabled."""
+        if self.use_phylo_features:
+            return data.species_species_edge_index, data.species_species_edge_attr
+
+        nodes = torch.arange(n_species_nodes, device=data.species_x_gen.device)
+        edge_index = torch.stack([nodes, nodes])
+        edge_shape = (n_species_nodes,) if data.species_species_edge_attr.dim() == 1 else (
+            n_species_nodes,
+            data.species_species_edge_attr.size(-1),
+        )
+        edge_attr = torch.zeros(edge_shape, dtype=data.species_species_edge_attr.dtype,
+                               device=data.species_species_edge_attr.device)
+        return edge_index, edge_attr
 
     def compute_reconstruction_mask(self, species_traits, observed_mask):
         reconstruction_mask = None
@@ -182,8 +207,9 @@ class TraitsPredictor(nn.Module):
 
             species_input = torch.cat([space_to_species, species_input], dim=1)
 
-        species_embeddings = self.species_gnn(species_input, data.species_species_edge_index,
-                                              edge_attr=data.species_species_edge_attr,
+        species_edge_index, species_edge_attr = self._species_graph_inputs(data, species_input.size(0))
+        species_embeddings = self.species_gnn(species_input, species_edge_index,
+                              edge_attr=species_edge_attr,
                                               return_attention_weights=return_attention_weights)
         if return_attention_weights:
             species_embeddings, species_attention_weights = species_embeddings
@@ -191,7 +217,7 @@ class TraitsPredictor(nn.Module):
         species_embeddings = species_embeddings.relu()
 
         predictions = self.fc(species_embeddings).chunk(len(self.trait_feature_keys), dim=-1)
-        if self.trait_representation == 'mean_std':
+        if 'species_x_std' in self.trait_feature_keys:
             mean, log_std = predictions
             # Apply softplus to log_std and add epsilon: sigma = softplus(log_std) + eps.
             predictions = (mean, F.softplus(log_std) + self.eps)
@@ -276,11 +302,14 @@ class DeterministicLoss(nn.Module):
             'huber_std': huber_std_vals[std_mask].mean().item() if std_mask.any() else 0.0,
         }
 
+        masked_huber_mean = huber_mean_vals.masked_fill(~mask, 0.0)
+        masked_huber_std = huber_std_vals.masked_fill(~std_mask, 0.0)
+
         if self.reduction == "sum":
-            return (huber_mean_vals * mask).sum() + (huber_std_vals * std_mask).sum()
+            return masked_huber_mean.sum() + masked_huber_std.sum()
 
         if not self.per_trait_reduction:
-            full_loss = (huber_mean_vals * mask).sum() + (huber_std_vals * std_mask).sum()
+            full_loss = masked_huber_mean.sum() + masked_huber_std.sum()
             return full_loss / mask.sum()
 
         # Per-trait mean, then average over active traits
@@ -288,10 +317,10 @@ class DeterministicLoss(nn.Module):
         n_per_trait_std = std_mask.float().sum(dim=0)       # (n_traits,)
         active_mean = n_per_trait_mean > 0
         active_std = n_per_trait_std > 0
-        loss_mean = ((huber_mean_vals * mask.float())[:, active_mean].sum(dim=0)
+        loss_mean = (masked_huber_mean[:, active_mean].sum(dim=0)
                      / n_per_trait_mean[active_mean]).mean()
         if active_std.any():
-            loss_std = ((huber_std_vals * std_mask.float())[:, active_std].sum(dim=0)
+            loss_std = (masked_huber_std[:, active_std].sum(dim=0)
                         / n_per_trait_std[active_std]).mean()
         else:
             loss_std = torch.zeros((), device=pred_mean.device)
@@ -307,8 +336,15 @@ class MultiTargetDeterministicLoss(nn.Module):
         self.cache = {}
 
     def forward(self, predictions, targets, mask=None) -> torch.Tensor:
-        if len(predictions) != 3 or len(targets) != 3:
-            raise ValueError('min_max_range loss requires min, max, and range predictions and targets')
+        if len(predictions) != len(targets):
+            raise ValueError('predictions and targets must have the same number of outputs')
+        
+        if len(predictions) == 3:
+            huber_keys = ('huber_min', 'huber_max', 'huber_range')
+        elif len(predictions) == 2: # TODO: permettere parametrizzazione midpoint + log-range
+            huber_keys = ('huber_min', 'huber_max')
+        else:
+            raise ValueError('min_max_range loss requires min, max, (and range) predictions and targets. Got inconsistent number of elements')
         if mask is None:
             mask = torch.ones_like(predictions[0], dtype=torch.bool)
         if not mask.any():
@@ -317,16 +353,17 @@ class MultiTargetDeterministicLoss(nn.Module):
         losses = [F.huber_loss(prediction, target, reduction='none') for prediction, target in zip(predictions, targets)]
         self.cache = {
             name: loss[mask].mean().item()
-            for name, loss in zip(('huber_min', 'huber_max', 'huber_range'), losses)
+            for name, loss in zip(huber_keys, losses)
         }
-        combined = sum(losses) / len(losses)
+        combined = torch.stack(losses).mean(dim=0)
+        masked_combined = combined.masked_fill(~mask, 0.0)
         if self.reduction == 'sum':
-            return (combined * mask.float()).sum()
+            return masked_combined.sum()
         if not self.per_trait_reduction:
-            return (combined * mask.float()).sum() / mask.sum()
+            return masked_combined.sum() / mask.sum()
         count_per_trait = mask.float().sum(dim=0)
         active_traits = count_per_trait > 0
-        return ((combined * mask.float())[:, active_traits].sum(dim=0)
+        return (masked_combined[:, active_traits].sum(dim=0)
                 / count_per_trait[active_traits]).mean()
         
 class MixedNLLLoss(nn.Module):

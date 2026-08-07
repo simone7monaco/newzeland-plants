@@ -26,6 +26,9 @@ from torch_geometric.transforms import KNNGraph, BaseTransform
 from torch_geometric.data import Data, HeteroData, InMemoryDataset
 from torch_geometric.utils import from_networkx, subgraph, bipartite_subgraph
 
+FEATURE_CACHE_VERSION = 2
+PROCESSED_DATA_VERSION = 4
+
 
 def _yj_transform(x: np.ndarray, lmbda: float) -> np.ndarray:
     """Apply Yeo-Johnson transform element-wise with the given lambda."""
@@ -121,13 +124,37 @@ class NormalizeFeatures(BaseTransform):
                     'std': torch.tensor(post_std, dtype=torch.float32),
                 }
             elif self.normalizations[k_norm] in ['logz', 'z']:
+                values = data[k_norm].float()
+                is_trait = k_norm in self.trait_attributes and hasattr(data, 'traits_nanmask')
+                observed_mask = ~data.traits_nanmask if is_trait else None
                 if self.normalizations[k_norm] == 'logz':
-                    data_k_norm = torch.log(data[k_norm] + eps)
+                    valid_values = values[observed_mask] if observed_mask is not None else values
+                    if (valid_values < 0).any():
+                        raise ValueError(
+                            f"logz normalization requires non-negative observed values in {k_norm}; "
+                            "use yj normalization for traits with negative measurements."
+                        )
+                    data_k_norm = torch.log(values + eps)
                 else:
-                    data_k_norm = data[k_norm]
-                mean = data_k_norm.mean(dim=0)
-                std = data_k_norm.std(dim=0)
-                std[std < eps] = 1.0 # prevent division by zero
+                    data_k_norm = values
+
+                if data_k_norm.dim() == 1:
+                    data_k_norm = data_k_norm.unsqueeze(1)
+
+                mean = torch.zeros(data_k_norm.size(1), dtype=data_k_norm.dtype)
+                std = torch.ones(data_k_norm.size(1), dtype=data_k_norm.dtype)
+                for j in range(data_k_norm.size(1)):
+                    valid = data_k_norm[:, j]
+                    if observed_mask is not None:
+                        valid = valid[observed_mask[:, j]]
+                    valid = valid[torch.isfinite(valid)]
+                    if valid.numel() == 0:
+                        continue
+                    mean[j] = valid.mean()
+                    if valid.numel() > 1:
+                        value_std = valid.std(unbiased=False)
+                        if value_std >= eps:
+                            std[j] = value_std
                 self.props[k_norm] = {'mean': mean, 'std': std}
             elif self.normalizations[k_norm] in ['sincos', None]:
                 pass
@@ -168,7 +195,8 @@ class NormalizeFeatures(BaseTransform):
             elif self.normalizations[k_norm] in ['logz', 'z']:
                 if self.normalizations[k_norm] == 'logz':
                     data[k_norm] = torch.log(data[k_norm] + eps)
-                data[k_norm] = (data[k_norm] - self.props[k_norm]['mean']) / self.props[k_norm]['std']
+                normalized = (data[k_norm] - self.props[k_norm]['mean']) / self.props[k_norm]['std']
+                data[k_norm] = torch.where(torch.isfinite(normalized), normalized, torch.zeros_like(normalized))
             elif self.normalizations[k_norm] is None:
                 pass
             else:
@@ -179,11 +207,13 @@ class NormalizeFeatures(BaseTransform):
         return data
     
     def inverse(self, data, warn=True, soft_clip=False, soft_clip_lower=0.0):
+        data = data.clone()
         if not getattr(data, 'normalized', False):
             raise ValueError("Data is not normalized")
         data.normalized = False
+        if hasattr(data, 'processed'):
+            data.processed = True
 
-        data = data.clone()
         for k_norm in self.normalizations:
             if k_norm not in data.keys():
                 if warn:
@@ -202,7 +232,7 @@ class NormalizeFeatures(BaseTransform):
                 data_np = data[k_norm].float().cpu().numpy()
                 for j in range(data_np.shape[1]):
                     data_np[:, j] = _yj_inverse(data_np[:, j], lambdas[j])
-                data[k_norm] = torch.tensor(data_np, dtype=data[k_norm].dtype)
+                data[k_norm] = torch.tensor(data_np, dtype=data[k_norm].dtype, device=data[k_norm].device)
                 if soft_clip and k_norm in {'species_x_mean', 'species_x_min', 'species_x_max'}:
                     data[k_norm] = soft_clip_lower + torch.nn.functional.softplus(data[k_norm] - soft_clip_lower)
             elif self.normalizations[k_norm] in ['logz', 'z']:
@@ -231,11 +261,17 @@ torch.serialization.add_safe_globals([NZData])
 
 class PlantDataset(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None, pre_filter=None,
-                 trait_representation='min_max_range', traits_filename='Traits.xlsx'):
+                 trait_representation='min_max_range', traits_filename='Traits.xlsx',
+                 invalid_bounds_policy='missing'):
         self.trait_representation = trait_representation
         self.pivot_feature = 'traits_mean' if self.trait_representation == 'mean_std' else 'traits_min'
         self.traits_filename = traits_filename
-        self.get_traits_df(root, trait_representation=trait_representation)
+        self.invalid_bounds_policy = invalid_bounds_policy
+        self.get_traits_df(
+            root,
+            trait_representation=trait_representation,
+            invalid_bounds_policy=invalid_bounds_policy,
+        )
         self.trait_names = list(getattr(self, self.pivot_feature).columns)
         self.y_index = np.arange(len(self.trait_names))
             
@@ -252,9 +288,11 @@ class PlantDataset(InMemoryDataset):
     
     
     def get_traits_df(self, root, dummy_threshold=0.05, drop_threshold=0.7,
-                      trait_representation='min_max_range'):
+                      trait_representation='min_max_range', invalid_bounds_policy='missing'):
         if trait_representation not in {'mean_std', 'min_max_range'}:
             raise ValueError("trait_representation must be 'mean_std' or 'min_max_range'")
+        if invalid_bounds_policy not in {'missing', 'error', 'keep'}:
+            raise ValueError("invalid_bounds_policy must be 'missing', 'error', or 'keep'")
 
         traits_path = root / self.traits_filename
         if not traits_path.exists():
@@ -357,12 +395,33 @@ class PlantDataset(InMemoryDataset):
                 for trait_name, columns in selected_traits.items()
             }, index=trait_values.index)
             calculated_range = self.traits_max - self.traits_min
-            print("Warning: Some traits are missing 'Range' columns; calculated from Min/Max.")
+            missing_range = [trait_name for trait_name, columns in selected_traits.items() if 'range' not in columns]
+            if missing_range:
+                print(f"Warning: Range was calculated from Min/Max for: {missing_range}")
             self.traits_range = pd.DataFrame({
                 trait_name: trait_values[columns['range']]
                 if 'range' in columns else calculated_range[trait_name]
                 for trait_name, columns in selected_traits.items()
             }, index=trait_values.index)
+            invalid_bounds = (self.traits_min < 0) | (self.traits_max < self.traits_min) | (self.traits_range < 0)
+            if invalid_bounds.any().any():
+                invalid_rows, invalid_columns = np.where(invalid_bounds.to_numpy())
+                invalid_locations = [
+                    f"{invalid_bounds.index[row]}:{invalid_bounds.columns[column]}"
+                    for row, column in zip(invalid_rows, invalid_columns, strict=True)
+                ]
+                message = (
+                    f"Found {int(invalid_bounds.to_numpy().sum())} invalid min/max/range records "
+                    f"({', '.join(invalid_locations[:5])})."
+                )
+                if invalid_bounds_policy == 'error':
+                    raise ValueError(message + " Correct source values or choose invalid_bounds_policy='missing' or 'keep'.")
+                if invalid_bounds_policy == 'missing':
+                    print(message + " Treating the complete trait record as missing.")
+                    for frame in (self.traits_min, self.traits_max, self.traits_range):
+                        frame.mask(invalid_bounds, inplace=True)
+                else:
+                    print(message + " Keeping values as requested.")
             # self.traits_mean = (self.traits_min + self.traits_max) / 2
             # self.traits_std = self.traits_range / np.sqrt(12.0)
 
@@ -401,7 +460,7 @@ class PlantDataset(InMemoryDataset):
         return [str(self.raw_dir / filename) for filename in self.get_raw_file_names()]
 
     def get_processed_file_names(self):
-        return [f'heterodata_{self.trait_representation}.pt']
+        return [f'heterodata_{self.trait_representation}_v{PROCESSED_DATA_VERSION}.pt']
 
     @property
     def processed_file_names(self):
@@ -416,20 +475,20 @@ class PlantDataset(InMemoryDataset):
 
     def load_complete(self, data_path):
         comp_rasters = []
-        df_path = (Path(self.root) / "Complete layers"/"{data_path}_space_df.csv")
+        df_path = Path(self.root) / "Complete layers" / f"{data_path}_space_df_v{FEATURE_CACHE_VERSION}.csv"
         if df_path.exists():
             return pd.read_csv(df_path, index_col=0)
         
-        for f in tqdm(list((Path(self.root) / "Complete layers"/data_path).rglob('*.tif')), desc=f'Loading {data_path}'):
+        for f in tqdm(sorted((Path(self.root) / "Complete layers" / data_path).rglob('*.tif')), desc=f'Loading {data_path}'):
             raster = self.load_raster(f)
-            filt_raster = raster.interp(x=self.space_df.x.values, y=self.space_df.y.values, method='nearest')
-            for band in filt_raster.band.values:
-                filt_raster = filt_raster.sel(band=band).to_pandas().reset_index().melt(id_vars=['y'])
+            interpolated_raster = raster.interp(x=self.space_df.x.values, y=self.space_df.y.values, method='nearest')
+            for band in interpolated_raster.band.values:
+                band_raster = interpolated_raster.sel(band=band).to_pandas().reset_index().melt(id_vars=['y'])
                 feat_name = f.stem if band == 0 else f"{f.stem}_{band}"
-                filt_raster = filt_raster.rename(columns={'value': feat_name})
+                band_raster = band_raster.rename(columns={'value': feat_name})
                 # TODO: va bene la media per tutte le variabili?
-                comp_rasters.append(self.space_df.set_index(['x', 'y']).join(filt_raster.set_index(['x', 'y'])).groupby(['cluster']).mean()[feat_name])
-                if feat_name == 'NZ population density layer':
+                comp_rasters.append(self.space_df.set_index(['x', 'y']).join(band_raster.set_index(['x', 'y'])).groupby(['cluster']).mean()[feat_name])
+                if f.stem == 'NZ population density layer':
                     comp_rasters[-1] = np.log1p(comp_rasters[-1])
         df = pd.concat(comp_rasters, axis=1)
         df.to_csv(df_path)
@@ -450,7 +509,7 @@ class PlantDataset(InMemoryDataset):
                     child.name = f"temp_{id(child)}"
                 G.add_edge(clade.name, child.name, weight=child.branch_length)
         
-        node2vec = Node2Vec(G, dimensions=16, walk_length=30, num_walks=200, workers=4)
+        node2vec = Node2Vec(G, dimensions=16, walk_length=30, num_walks=200, workers=1, seed=42)
         model = node2vec.fit(window=10, min_count=1, batch_words=4)
 
         # Create node embeddings
@@ -475,6 +534,8 @@ class PlantDataset(InMemoryDataset):
 
         for node in G_species.nodes():
             G_species.nodes[node]["x"] = node_embeddings[node]
+        for source, target, attributes in G_species.edges(data=True):
+            attributes['weight'] = float(attributes['weight'])
         self.species_graph = from_networkx(G_species)  # Include node attributes
         self.species_graph.node_names = [n for n in G_species.nodes()]  # Map node names to indices
 
@@ -521,7 +582,6 @@ class PlantDataset(InMemoryDataset):
         ar = ar.where(ar.isnull(), 1)
 
     def process(self):
-        # TODO: Ablation studies 
         species_graph = self.get_species_graph()
         spatial_graph = self.get_spatial_graph()
         clim_rasters = self.load_complete('Climatic layers')
@@ -532,8 +592,12 @@ class PlantDataset(InMemoryDataset):
         index_space_specie_path = Path(self.root) / 'index_space_specie.csv'
         if index_space_specie_path.exists():
             index_space_specie = pd.read_csv(index_space_specie_path)
+            required_columns = {'cluster', 'species', 'occurrence'}
+            if not required_columns.issubset(index_space_specie.columns):
+                index_space_specie = pd.DataFrame()
         else:
             index_space_specie = pd.DataFrame()
+        if index_space_specie.empty:
             raw_paths = [self.raw_dir / filename for filename in self.get_raw_file_names()]
             for f in tqdm(raw_paths, desc='Processing distribution layers'):
                 raster = self.load_raster(f)
@@ -546,9 +610,14 @@ class PlantDataset(InMemoryDataset):
                 occurence_df = occurence_df.set_index(['x', 'y']).join(self.space_df.set_index(['x', 'y']))
                 index_space_specie = pd.concat([occurence_df.groupby('cluster').sum().reset_index().assign(species=species_name),
                                                 index_space_specie,], axis=0, ignore_index=True)
-                
-            index_space_specie['species_idx'] = index_space_specie.species.apply(lambda x: species_graph.node_names.index(x))
-            index_space_specie.to_csv(index_space_specie_path, index=False)
+
+        species_to_index = {species: index for index, species in enumerate(species_graph.node_names)}
+        index_space_specie['species_idx'] = index_space_specie.species.map(species_to_index)
+        if index_space_specie['species_idx'].isna().any():
+            unknown_species = index_space_specie.loc[index_space_specie['species_idx'].isna(), 'species'].unique().tolist()
+            raise RuntimeError(f'Distribution index contains species absent from the graph: {unknown_species[:5]}')
+        index_space_specie['species_idx'] = index_space_specie['species_idx'].astype(int)
+        index_space_specie.to_csv(index_space_specie_path, index=False)
             
         bip_edge_index = torch.tensor(index_space_specie[['cluster', 'species_idx']].values.T, dtype=torch.long)
         bip_edge_attr = torch.tensor(index_space_specie.occurrence.values, dtype=torch.float32).unsqueeze(1)
@@ -571,6 +640,7 @@ class PlantDataset(InMemoryDataset):
         data_all.spatial_x = spatial_graph.pos
         data_all.spatial_pos = spatial_graph.pos # repeated to stay un-normalized
         data_all.spatial_global_data = torch.tensor(self.global_data.values, dtype=torch.float32)
+        data_all.spatial_global_feature_names = self.global_data.columns.astype(str).tolist()
         data_all.species_species_edge_index = species_graph.edge_index
         data_all.species_species_edge_attr = species_graph.weight
         data_all.spatial_spatial_edge_index = spatial_graph.edge_index
@@ -590,28 +660,34 @@ class PlantDataset(InMemoryDataset):
         return data
         
 
-def data_split(data, test_size=0.3, k=0, seed=42):
-    G = nx.Graph()
-    G.add_nodes_from(range(data.species_num_nodes))
-    # G.add_edges_from(data.edge_index_species.T.numpy())
-    G.add_edges_from(data.species_species_edge_index.T.numpy())
-    communities = list(nx.algorithms.community.louvain_communities(G))
+def data_split(data, test_size=0.3, k=0, seed=42, split_strategy='random'):
+    n_species = data.species_num_nodes
+    if split_strategy == 'random':
+        splitter = KFold(n_splits=5, random_state=seed, shuffle=True)
+        splits = list(splitter.split(np.arange(n_species)))
+    elif split_strategy == 'louvain':
+        graph = nx.Graph()
+        graph.add_nodes_from(range(n_species))
+        graph.add_edges_from(data.species_species_edge_index.T.numpy())
+        communities = list(nx.algorithms.community.louvain_communities(graph, seed=seed))
+        groups = np.empty(n_species, dtype=int)
+        for group_index, community in enumerate(communities):
+            groups[list(community)] = group_index
 
-    cs = []
-    for i, community in enumerate(communities):
-        cs.extend(((node, i) for node in community))
+        largest_community = max(len(community) for community in communities)
+        target_fold_size = int(np.ceil(n_species / 5))
+        if largest_community > target_fold_size:
+            raise ValueError(
+                f'Louvain split cannot form balanced 5-fold CV: largest community has {largest_community} species, '
+                f'but a fold targets about {target_fold_size}. Use random transductive CV or sparsify the phylogenetic graph first.'
+            )
+        splitter = GroupKFold(n_splits=5)
+        splits = list(splitter.split(np.arange(n_species), groups=groups))
+    else:
+        raise ValueError("split_strategy must be 'random' or 'louvain'.")
 
-    cs = pd.DataFrame(cs, columns=['species_idx', 'community'])
-    cs.loc[cs.community.groupby(cs.community).transform('size').eq(1), 'community'] = cs.community.max() + 1
-
-    # split the bigger communities into smaller ones (if they are bigger than 1/5 of the dataset, slit by tiles of 1/5 of the community size)
-    for i, community in cs.groupby('community'):
-        if len(community) > len(cs) / 5:
-            cs.loc[community.index, 'community'] = (community.species_idx // (len(community) // 5)).astype(int) + cs.community.max() + 1
-
-    splitter = KFold(n_splits=5, random_state=seed, shuffle=True)
-    splits = [s for s in splitter.split(G.nodes())] # type: ignore
-    #splits = [s for s in splitter.split(G.nodes(), groups=cs.community)]
+    if not 0 <= k < len(splits):
+        raise ValueError(f'Fold index {k} is outside [0, {len(splits) - 1}].')
     train_nodes, test_nodes = splits[k]
 
     train_mask = torch.zeros(data.species_num_nodes, dtype=torch.bool)

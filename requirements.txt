@@ -12,3 +12,5 @@ optuna
 PyYAML
 lightning
 torch_geometric
+plotly
+streamlit

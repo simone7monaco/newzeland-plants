@@ -25,6 +25,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd
+import json
 from pathlib import Path
 from tqdm import trange
 from scipy import stats as sp_stats
@@ -215,17 +216,23 @@ def compute_metrics_minmax(pred_min, pred_max, pred_range, true_min, true_max, t
         n_eval = int(m.sum().item())
         if n_eval < 2:
             for var in ['min', 'max', 'range']:
+                if pred_range is None and var == 'range':
+                    continue
                 records.append(dict(trait=trait_names[j], variable=var, n=n_eval, RMSE=np.nan, MAE=np.nan, Pearson_r=np.nan, Spearman_rho=np.nan))
             continue
 
         pmin = pred_min[m, j].cpu().numpy()
         pmax = pred_max[m, j].cpu().numpy()
-        pr = pred_range[m, j].cpu().numpy()
         tmin = true_min[m, j].cpu().numpy()
         tmax = true_max[m, j].cpu().numpy()
-        tr = true_range[m, j].cpu().numpy()
+        if pred_range is not None:
+            pr = pred_range[m, j].cpu().numpy()
+            tr = true_range[m, j].cpu().numpy()
+            metric_tuples = [('min', pmin, tmin), ('max', pmax, tmax), ('range', pr, tr)]
+        else:
+            metric_tuples = [('min', pmin, tmin), ('max', pmax, tmax)]
 
-        for name, p, t in [('min', pmin, tmin), ('max', pmax, tmax), ('range', pr, tr)]:
+        for name, p, t in metric_tuples:
             err = p - t
             rmse = float(np.sqrt(np.mean(err ** 2)))
             mae = float(np.mean(np.abs(err)))
@@ -236,101 +243,144 @@ def compute_metrics_minmax(pred_min, pred_max, pred_range, true_min, true_max, t
     return pd.DataFrame(records)
 
 
-def compute_conformal_residual_bounds(
-    pred_mean,
-    pred_std,
-    true_mean,
-    eval_mask,
-    trait_names,
-    alpha=0.10,
-    eps=1e-8,
-):
-    """Compute trait-wise split-conformal residual bounds.
+def _conformal_quantile(scores: np.ndarray, alpha: float) -> float:
+    """Return the finite-sample split-conformal quantile for nonconformity scores."""
+    if scores.size == 0:
+        return float("nan")
+    rank = min(int(np.ceil((scores.size + 1) * (1.0 - alpha))), scores.size)
+    return float(np.partition(scores, rank - 1)[rank - 1])
 
-    The nonconformity score is |y - y_hat| / sigma. For each trait, the
-    returned q_hat is the (1 - alpha) empirical quantile of that score over
-    evaluated cells, and the boolean mask marks evaluated cells that satisfy
-    the conformal bound.
-    """
+
+def fit_conformal_residual_bounds(
+    pred_mean, pred_std, true_mean, calibration_mask, trait_names, alpha=0.10, eps=1e-8,
+):
+    """Fit trait-wise conformal score bounds on an independent calibration mask."""
+    records = []
+    for j in range(pred_mean.size(1)):
+        mask = calibration_mask[:, j]
+        n_calibration = int(mask.sum().item())
+        if n_calibration < 2:
+            records.append(dict(trait=trait_names[j], alpha=alpha, n_calibration=n_calibration, q_hat=np.nan))
+            continue
+        score = np.abs(
+            (true_mean[mask, j] - pred_mean[mask, j]).detach().cpu().numpy()
+        ) / np.maximum(pred_std[mask, j].detach().cpu().numpy(), eps)
+        records.append(dict(
+            trait=trait_names[j], alpha=alpha, n_calibration=n_calibration,
+            q_hat=_conformal_quantile(score, alpha),
+        ))
+    return pd.DataFrame(records)
+
+
+def apply_conformal_residual_bounds(
+    pred_mean, pred_std, true_mean, eval_mask, trait_names, calibration_bounds, eps=1e-8,
+):
+    """Apply independently fitted conformal bounds to an evaluation mask."""
+    bounds = calibration_bounds.set_index("trait") if calibration_bounds is not None else pd.DataFrame()
     records = []
     reliable_mask = torch.zeros_like(eval_mask, dtype=torch.bool)
-
-    n_traits = pred_mean.size(1)
-    for j in range(n_traits):
-        m = eval_mask[:, j]
-        n_eval = int(m.sum().item())
-        if n_eval < 2:
+    for j in range(pred_mean.size(1)):
+        mask = eval_mask[:, j]
+        n_eval = int(mask.sum().item())
+        bound = bounds.loc[trait_names[j]] if trait_names[j] in bounds.index else None
+        q_hat = float(bound["q_hat"]) if bound is not None else float("nan")
+        n_calibration = int(bound["n_calibration"]) if bound is not None else 0
+        alpha = float(bound["alpha"]) if bound is not None else np.nan
+        if n_eval < 1 or not np.isfinite(q_hat):
             records.append(dict(
-                trait=trait_names[j], n=n_eval, alpha=alpha,
-                q_hat=np.nan, mean_abs_residual=np.nan,
-                empirical_coverage=np.nan,
+                trait=trait_names[j], n=n_eval, n_calibration=n_calibration, alpha=alpha,
+                q_hat=q_hat, mean_abs_residual=np.nan, empirical_coverage=np.nan,
+                calibration_source="inner_validation" if bound is not None else "unavailable",
             ))
             continue
-
-        p = pred_mean[m, j].detach().cpu().numpy()
-        s = pred_std[m, j].detach().cpu().numpy()
-        t = true_mean[m, j].detach().cpu().numpy()
-        score = np.abs(t - p) / np.maximum(s, eps)
-        q_hat = float(np.quantile(score, 1.0 - alpha))
+        score = np.abs(
+            (true_mean[mask, j] - pred_mean[mask, j]).detach().cpu().numpy()
+        ) / np.maximum(pred_std[mask, j].detach().cpu().numpy(), eps)
         within = score <= q_hat
-        reliable_mask[m, j] = torch.as_tensor(within, device=eval_mask.device)
-
+        reliable_mask[mask, j] = torch.as_tensor(within, device=eval_mask.device)
         records.append(dict(
-            trait=trait_names[j],
-            n=n_eval,
-            alpha=alpha,
+            trait=trait_names[j], n=n_eval, n_calibration=n_calibration, alpha=alpha,
             q_hat=q_hat,
-            mean_abs_residual=float(np.mean(np.abs(t - p))),
-            empirical_coverage=float(np.mean(within)),
+            mean_abs_residual=float(np.mean(np.abs(true_mean[mask, j].detach().cpu().numpy() - pred_mean[mask, j].detach().cpu().numpy()))),
+            empirical_coverage=float(np.mean(within)), calibration_source="inner_validation",
         ))
-
     return pd.DataFrame(records), reliable_mask
 
 
-def compute_conformal_residual_bounds_minmax(
-    pred_min, pred_max, pred_range,
-    true_min, true_max, true_range,
-    eval_mask, trait_names, alpha=0.10,
+def fit_conformal_residual_bounds_minmax(
+    pred_min, pred_max, pred_range, true_min, true_max, true_range,
+    calibration_mask, trait_names, alpha=0.10,
 ):
-    """Compute split-conformal absolute residual bounds for min/max/range variables.
+    """Fit absolute-residual conformal bounds for min/max/range on calibration cells."""
+    records = []
+    for j in range(pred_min.size(1)):
+        mask = calibration_mask[:, j]
+        n_calibration = int(mask.sum().item())
+        for variable, prediction, target in (
+            ("min", pred_min, true_min),
+            ("max", pred_max, true_max),
+            ("range", pred_range, true_range),
+        ):
+            q_hat = float("nan")
+            if n_calibration >= 2:
+                scores = np.abs((target[mask, j] - prediction[mask, j]).detach().cpu().numpy())
+                q_hat = _conformal_quantile(scores, alpha)
+            records.append(dict(
+                trait=trait_names[j], variable=variable, alpha=alpha,
+                n_calibration=n_calibration, q_hat=q_hat,
+            ))
+    return pd.DataFrame(records)
 
-    Uses absolute residual score |y - y_hat| and returns q_hat per trait-variable.
-    The returned reliable_mask marks cells where all three variables satisfy their respective bounds.
-    """
+
+def apply_conformal_residual_bounds_minmax(
+    pred_min, pred_max, pred_range, true_min, true_max, true_range,
+    eval_mask, trait_names, calibration_bounds,
+):
+    """Apply calibration-derived min/max/range bounds to outer-test cells."""
+    bounds = calibration_bounds.set_index(["trait", "variable"]) if calibration_bounds is not None else pd.DataFrame()
     records = []
     reliable_mask = torch.zeros_like(eval_mask, dtype=torch.bool)
-    n_traits = pred_min.size(1)
-    for j in range(n_traits):
-        m = eval_mask[:, j]
-        n_eval = int(m.sum().item())
-        if n_eval < 2:
-            for var in ['min', 'max', 'range']:
-                records.append(dict(trait=trait_names[j], variable=var, n=n_eval, alpha=alpha, q_hat=np.nan, mean_abs_residual=np.nan, empirical_coverage=np.nan))
-            continue
 
-        pmin = pred_min[m, j].detach().cpu().numpy()
-        pmax = pred_max[m, j].detach().cpu().numpy()
-        pr = pred_range[m, j].detach().cpu().numpy()
-        tmin = true_min[m, j].detach().cpu().numpy()
-        tmax = true_max[m, j].detach().cpu().numpy()
-        tr = true_range[m, j].detach().cpu().numpy()
+    if pred_range is not None:
+        target_vars = (
+            ("min", pred_min, true_min),
+            ("max", pred_max, true_max),
+            ("range", pred_range, true_range),
+        )
+    else:
+        target_vars = (
+            ("min", pred_min, true_min),
+            ("max", pred_max, true_max),
+        )
 
-        scores = {
-            'min': np.abs(tmin - pmin),
-            'max': np.abs(tmax - pmax),
-            'range': np.abs(tr - pr),
-        }
-        within_dict = {}
-        for var, score in scores.items():
-            q_hat = float(np.quantile(score, 1.0 - alpha))
-            within = score <= q_hat
-            within_dict[var] = within
-            records.append(dict(trait=trait_names[j], variable=var, n=n_eval, alpha=alpha, q_hat=q_hat, mean_abs_residual=float(np.mean(score)), empirical_coverage=float(np.mean(within))))
-
-        # mark reliable when all three variables are within their bounds
-        combined_within = np.logical_and.reduce([within_dict['min'], within_dict['max'], within_dict['range']])
-        reliable_mask[m, j] = torch.as_tensor(combined_within, device=eval_mask.device)
-
+    for j in range(pred_min.size(1)):
+        mask = eval_mask[:, j]
+        n_eval = int(mask.sum().item())
+        within_by_variable = []
+        for variable, prediction, target in target_vars:
+            key = (trait_names[j], variable)
+            bound = bounds.loc[key] if key in bounds.index else None
+            q_hat = float(bound["q_hat"]) if bound is not None else float("nan")
+            n_calibration = int(bound["n_calibration"]) if bound is not None else 0
+            alpha = float(bound["alpha"]) if bound is not None else np.nan
+            if n_eval < 1 or not np.isfinite(q_hat):
+                within_by_variable.append(np.zeros(n_eval, dtype=bool))
+                records.append(dict(
+                    trait=trait_names[j], variable=variable, n=n_eval, n_calibration=n_calibration,
+                    alpha=alpha, q_hat=q_hat, mean_abs_residual=np.nan, empirical_coverage=np.nan,
+                    calibration_source="inner_validation" if bound is not None else "unavailable",
+                ))
+                continue
+            residual = (target[mask, j] - prediction[mask, j]).detach().cpu().numpy()
+            within = np.abs(residual) <= q_hat
+            within_by_variable.append(within)
+            records.append(dict(
+                trait=trait_names[j], variable=variable, n=n_eval, n_calibration=n_calibration,
+                alpha=alpha, q_hat=q_hat, mean_abs_residual=float(np.mean(np.abs(residual))),
+                empirical_coverage=float(np.mean(within)), calibration_source="inner_validation",
+            ))
+        if n_eval:
+            reliable_mask[mask, j] = torch.as_tensor(np.logical_and.reduce(within_by_variable), device=eval_mask.device)
     return pd.DataFrame(records), reliable_mask
 
 
@@ -338,8 +388,21 @@ def compute_conformal_residual_bounds_minmax(
 # Part 2 — XAI: Integrated Gradients
 # =====================================================================
 
+def _mask_target_trait_for_imputation(data, test_indices, trait_index, var_names):
+    """Apply the same target-trait mask used by leave-one-trait-out evaluation."""
+
+    for var_n in var_names:
+        values = getattr(data, f'species_x_{var_n}')
+        target_mask = torch.zeros_like(values, dtype=torch.bool)
+        target_mask[test_indices, trait_index] = True
+        setattr(data, f'species_x_{var_n}', values.masked_fill(target_mask, 0.0))
+    traits_nanmask = data.traits_nanmask.clone()
+    traits_nanmask[test_indices, trait_index] = True
+    data.traits_nanmask = traits_nanmask
+
+
 def _species_ig(model, data, test_indices, trait_names, device,
-                n_steps=50, internal_batch_size=None, gen_col_names=None):
+                n_steps=50, internal_batch_size=None, gen_col_names=None, var_names=['min', 'max', 'range']):
     """
     IG attributions for **species-side** inputs
     (trait means, trait stds, genetic dummies, phylogenetic embeddings).
@@ -349,18 +412,17 @@ def _species_ig(model, data, test_indices, trait_names, device,
     and Captum sums over the n_test outputs, so a single IG call yields
     per-input-element attributions aggregated across all test species.
 
+    The target trait is zeroed and marked missing for every test species before
+    each IG pass, matching the leave-one-trait-out imputation condition.
+
     Returns  DataFrame  (n_test x n_traits rows)  x  (input features)
     """
     from captum.attr import IntegratedGradients
 
     model.eval()
 
-    if hasattr(data, 'species_x_mean'):
-        trait_mode = 'mean_std'
-        var_names = ['mean', 'std']
-    else:
-        trait_mode = 'min_max_range'
-        var_names = ['min', 'max', 'range']
+    trait_mode = 'mean_std' if hasattr(data, 'species_x_mean') else 'min_max_range'
+    # var_names = ['mean', 'std']
 
     n_trait_cols = len(var_names)
     pivot_variable = f'species_x_{var_names[0]}'
@@ -373,21 +435,14 @@ def _species_ig(model, data, test_indices, trait_names, device,
     n_spatial_nodes = data.spatial_num_nodes
     n_sp_feat = n_traits * n_trait_cols + n_gen + n_phylo
 
-    if trait_mode == 'mean_std':
-        assert data.species_x_mean.size(0) == n_species_nodes, \
-            f"species_x_mean rows {data.species_x_mean.size(0)} != species_num_nodes {n_species_nodes}"
-        assert data.species_x_std.size(0) == n_species_nodes, \
-            f"species_x_std rows {data.species_x_std.size(0)} != species_num_nodes {n_species_nodes}"
-        n_std = data.species_x_std.size(1)
-        assert n_traits == n_std, \
-            f"trait mean/std column-count mismatch: {n_traits} vs {n_std}"
-    else:
-        assert data.species_x_min.size(0) == n_species_nodes, \
-            f"species_x_min rows {data.species_x_min.size(0)} != species_num_nodes {n_species_nodes}"
-        assert data.species_x_max.size(0) == n_species_nodes, \
-            f"species_x_max rows {data.species_x_max.size(0)} != species_num_nodes {n_species_nodes}"
-        assert data.species_x_range.size(0) == n_species_nodes, \
-            f"species_x_range rows {data.species_x_range.size(0)} != species_num_nodes {n_species_nodes}"
+
+    for i, x_var in enumerate(var_names):
+        assert getattr(data, f"species_x_{x_var}").size(0) == n_species_nodes, \
+            f"species_x_{x_var} rows {getattr(data, f'species_x_{x_var}').size(0)} != species_num_nodes {n_species_nodes}"
+        if i > 0:
+            n_i = data.species_x_std.size(1)
+            assert n_traits == n_i, \
+                f"trait {var_names[0]}/{var_names[i]} column-count mismatch: {n_traits} vs {n_i}"
 
     assert data.spatial_x.size(0) == n_spatial_nodes, \
         f"spatial_x rows {data.spatial_x.size(0)} != spatial_num_nodes {n_spatial_nodes}"
@@ -411,6 +466,7 @@ def _species_ig(model, data, test_indices, trait_names, device,
         f"test_indices max {test_indices.max()} out of [0, n_species_nodes={n_species_nodes})"
 
     _checked = [False]
+    active_target_trait = [0]
 
     def forward_fn(sp_feat):
         first_call = not _checked[0]
@@ -435,10 +491,16 @@ def _species_ig(model, data, test_indices, trait_names, device,
                     chunk, [n_traits, n_traits, n_gen, n_phylo], dim=1
                 )
             else:
-                # min, max, range, visibility, gen, phylo
-                dtmp.species_x_min, dtmp.species_x_max, dtmp.species_x_range, dtmp.species_x_gen, dtmp.species_x_phylo = torch.split(
-                    chunk, [n_traits, n_traits, n_traits, n_gen, n_phylo], dim=1
-                )
+                # min, max, (range,) visibility, gen, phylo
+                if 'range' in var_names:
+                    dtmp.species_x_min, dtmp.species_x_max, dtmp.species_x_range, dtmp.species_x_gen, dtmp.species_x_phylo = torch.split(
+                        chunk, [n_traits, n_traits, n_traits, n_gen, n_phylo], dim=1
+                    )
+                else:
+                    dtmp.species_x_min, dtmp.species_x_max, dtmp.species_x_gen, dtmp.species_x_phylo = torch.split(
+                                            chunk, [n_traits, n_traits, n_gen, n_phylo], dim=1
+                                        )
+            _mask_target_trait_for_imputation(dtmp, test_indices, active_target_trait[0], var_names)
             dtmp.num_nodes = n_species_nodes + data_dev.spatial_num_nodes
             if first_call and i == 0:
                 # spatial features must be untouched by species-side perturbation
@@ -478,16 +540,23 @@ def _species_ig(model, data, test_indices, trait_names, device,
         outputs = outputs.view(virtual_batch, n_species_nodes, -1)[:, test_indices]
         return outputs.reshape(-1, outputs.size(-1))
 
-    if trait_mode == 'mean_std':
-        sp_input = torch.cat([
-            data.species_x_mean, data.species_x_std,
-            data.species_x_gen, data.species_x_phylo,
-        ], dim=1).to(device).requires_grad_(True)
-    else:
-        sp_input = torch.cat([
-            data.species_x_min, data.species_x_max, data.species_x_range,
-            data.species_x_gen, data.species_x_phylo,
-        ], dim=1).to(device).requires_grad_(True)
+
+    sp_input = torch.cat([
+        getattr(data, f"species_x_{var_n}") for var_n in var_names
+        ] + [data.species_x_gen, data.species_x_phylo],
+        dim=1).to(device).requires_grad_(True)
+
+    # TODO: remove here
+    # if tait_mode == 'mean_std':
+    #     sp_input = torch.cat([
+    #         data.species_x_mean, data.species_x_std,
+    #         data.species_x_gen, data.species_x_phylo,
+    #     ], dim=1).to(device).requires_grad_(True)
+    # else:
+    #     sp_input = torch.cat([
+    #         data.species_x_min, data.species_x_max, data.species_x_range,
+    #         data.species_x_gen, data.species_x_phylo,
+    #     ], dim=1).to(device).requires_grad_(True)
 
     baseline = torch.zeros_like(sp_input)
     ig = IntegratedGradients(forward_fn)
@@ -499,24 +568,24 @@ def _species_ig(model, data, test_indices, trait_names, device,
         else [f"gen_{i}" for i in range(n_gen)]
     )
     phylo_cols = [f"phylo_{i}" for i in range(n_phylo)]
-    
-    if trait_mode == 'mean_std':
-        mean_cols = [f"mean_{t}" for t in trait_names]
-        std_cols = [f"std_{t}" for t in trait_names]
-        all_cols = mean_cols + std_cols + g_cols + phylo_cols
-    else:
-        min_cols = [f"min_{t}" for t in trait_names]
-        max_cols = [f"max_{t}" for t in trait_names]
-        range_cols = [f"range_{t}" for t in trait_names]
-        all_cols = min_cols + max_cols + range_cols + g_cols + phylo_cols
 
+    all_cols = []
+    for var_n in var_names:
+        all_cols += [f"{var_n}_{t}" for t in trait_names]
+
+    all_cols = all_cols + g_cols + phylo_cols
     species_names = [data.species_names[i] for i in test_indices.cpu().numpy()]
 
     rows = []
     for var_idx, var_name in enumerate(var_names):
         for j in trange(n_traits, desc=f"Species IG ({var_name})"):
             target = var_idx * n_traits + j
-            attr = ig.attribute(sp_input, baselines=baseline, target=target, n_steps=n_steps, internal_batch_size=internal_batch_size)
+            input_mask = torch.ones_like(sp_input)
+            for trait_block in range(n_trait_cols):
+                input_mask[test_indices, trait_block * n_traits + j] = 0.0
+            active_target_trait[0] = j
+            masked_sp_input = (sp_input * input_mask).detach().requires_grad_(True)
+            attr = ig.attribute(masked_sp_input, baselines=baseline, target=target, n_steps=n_steps, internal_batch_size=internal_batch_size)
             arr = attr[test_indices].detach().cpu().numpy()
             df_j = pd.DataFrame(arr, index=species_names, columns=all_cols)
             df_j["target_trait"] = trait_names[j]
@@ -533,7 +602,7 @@ def _species_ig(model, data, test_indices, trait_names, device,
 
 
 def _spatial_ig(model, data, test_indices, trait_names,
-                env_col_names, device, n_steps=30, internal_batch_size=None):
+                env_col_names, device, n_steps=30, internal_batch_size=None, var_names=['min', 'max', 'range']):
     """
     IG attributions for **spatial / environmental** features.
 
@@ -542,18 +611,16 @@ def _spatial_ig(model, data, test_indices, trait_names,
     to per-test-species importance by weighting connected spatial nodes
     with their normalised bipartite occurrence edge weights.
 
+    The target trait is zeroed and marked missing for every test species before
+    each IG pass, matching the leave-one-trait-out imputation condition.
+
     Returns  DataFrame  (n_test x n_traits rows)  x  (env features)
     """
     from captum.attr import IntegratedGradients
 
     model.eval()
 
-    if hasattr(data, 'species_x_mean'):
-        trait_mode = 'mean_std'
-        var_names = ['mean', 'std']
-    else:
-        trait_mode = 'min_max_range'
-        var_names = ['min', 'max', 'range']
+    trait_mode = 'mean_std' if hasattr(data, 'species_x_mean') else 'min_max_range'
 
     n_trait_cols = len(var_names)
     pivot_variable = f'species_x_{var_names[0]}'
@@ -593,6 +660,7 @@ def _spatial_ig(model, data, test_indices, trait_names,
         f"test_indices max {test_indices.max()} out of [0, n_sp_nodes={n_sp_nodes})"
 
     _checked = [False]
+    active_target_trait = [0]
 
     def forward_fn(spatial_feat):
         first_call = not _checked[0]
@@ -615,12 +683,14 @@ def _spatial_ig(model, data, test_indices, trait_names,
             dtmp.spatial_x, dtmp.spatial_global_data = torch.split(
                 chunk, [n_spatial_x, chunk.size(1) - n_spatial_x], dim=1
             )
+            _mask_target_trait_for_imputation(dtmp, test_indices, active_target_trait[0], trait_mode)
             dtmp.num_nodes = n_sp_nodes + n_sa_nodes
             if first_call and i == 0:
-                # species features must be untouched by spatial-side perturbation
+                expected_pivot = data_dev[pivot_variable].detach().clone()
+                expected_pivot[test_indices, active_target_trait[0]] = 0.0
                 assert torch.equal(
-                    dtmp[pivot_variable].detach(), data_dev[pivot_variable].detach()
-                ), f"{pivot_variable} was modified inside spatial IG forward_fn"
+                    dtmp[pivot_variable].detach(), expected_pivot
+                ), f"{pivot_variable} did not preserve the expected target mask"
                 assert torch.equal(
                     dtmp.species_x_gen.detach(), data_dev.species_x_gen.detach()
                 ), "species_x_gen was modified inside spatial IG forward_fn"
@@ -678,6 +748,7 @@ def _spatial_ig(model, data, test_indices, trait_names,
     for var_idx, var_name in enumerate(var_names):
         for j in trange(n_traits, desc=f"Spatial IG ({var_name})"):
             target = var_idx * n_traits + j
+            active_target_trait[0] = j
             attr = ig.attribute(spatial_input, baselines=baseline, target=target, n_steps=n_steps, internal_batch_size=internal_batch_size)
             attr_np = attr.detach().cpu().numpy()
             per_sp = np.zeros((n_test, n_feat))
@@ -732,8 +803,8 @@ def sanity_check_results(
                                min_eval_fraction of test species evaluated
     7.  ig_nonzero_species   – (if sp_attr given) mean |IG| > 1e-6 for ≥ 50 %
                                of species feature columns
-    8.  ig_self_attribution  – (if sp_attr given) mean_{trait} column ranks top-3
-                               for its own target trait
+    8.  ig_target_masked     – (if sp_attr given) all target-trait input
+                               attributions are near zero after masking
     9.  ig_nonzero_spatial   – (if sa_attr given) same non-zero check as (7)
     """
     _GREEN  = "\033[92m"
@@ -831,7 +902,7 @@ def sanity_check_results(
 
     # 8–9. Species-side IG checks
     if sp_attr is not None:
-        feat_cols = [c for c in sp_attr.columns if c not in {"species", "target_trait"}]
+        feat_cols = sp_attr.select_dtypes(include=[np.number]).columns.tolist()
 
         # 8. Non-zero attributions
         mean_abs = sp_attr[feat_cols].abs().mean()
@@ -839,26 +910,21 @@ def sanity_check_results(
         _ok("ig_nonzero_species", nonzero_frac >= 0.5,
             f"only {nonzero_frac:.1%} of species features have mean |IG| > 1e-6")
 
-        # 9. Self-attribution: mean_{trait} should rank top-3 for its own target
-        self_attr_fail = []
+        # 9. The target trait must be invisible in leave-one-trait-out IG.
+        target_mask_fail = []
         for t in trait_names:
-            # prefer mean_; fall back to range_, min_, max_
-            candidates = [f"mean_{t}", f"range_{t}", f"min_{t}", f"max_{t}"]
-            col = next((c for c in candidates if c in sp_attr.columns), None)
-            if col is None:
-                continue
+            candidates = [f"mean_{t}", f"std_{t}", f"min_{t}", f"max_{t}", f"range_{t}"]
             subset = sp_attr[sp_attr["target_trait"] == t]
             if subset.empty:
                 continue
-            ranked = subset[feat_cols].abs().mean().nlargest(3).index.tolist()
-            if col not in ranked:
-                rank = int(subset[feat_cols].abs().mean().rank(ascending=False)[col])
-                self_attr_fail.append(f"{t} (rank {rank})")
-        _ok("ig_self_attribution", len(self_attr_fail) == 0,
-            "; ".join(self_attr_fail[:5]) + ("…" if len(self_attr_fail) > 5 else ""))
+            for col in candidates:
+                if col in subset and float(subset[col].abs().max()) > 1e-6:
+                    target_mask_fail.append(f"{t}:{col}")
+        _ok("ig_target_masked", len(target_mask_fail) == 0,
+            "; ".join(target_mask_fail[:5]) + ("…" if len(target_mask_fail) > 5 else ""))
     else:
         _skip("ig_nonzero_species",  "no species attributions")
-        _skip("ig_self_attribution", "no species attributions")
+        _skip("ig_target_masked", "no species attributions")
 
     # 10. Spatial IG non-zero
     if sa_attr is not None:
@@ -948,7 +1014,17 @@ def sanity_check_results_minmax(
     _ok("eval_coverage", len(thin_traits) == 0, "; ".join(thin_traits) if thin_traits else "")
 
     _skip("coverage_calibration", "not applicable for min/max/range (no predictive std)")
-    _skip("ig_self_attribution", "skipped for min/max/range")
+    if sp_attr is not None:
+        target_mask_fail = []
+        for trait in trait_names:
+            subset = sp_attr[sp_attr["target_trait"] == trait]
+            for column in (f"min_{trait}", f"max_{trait}", f"range_{trait}"):
+                if column in subset and float(subset[column].abs().max()) > 1e-6:
+                    target_mask_fail.append(f"{trait}:{column}")
+        _ok("ig_target_masked", len(target_mask_fail) == 0,
+            "; ".join(target_mask_fail[:5]) + ("…" if len(target_mask_fail) > 5 else ""))
+    else:
+        _skip("ig_target_masked", "no species attributions")
 
     n_pass = sum(results.values())
     n_total = len(results)
@@ -1128,6 +1204,7 @@ class Tester:
                     ig_internal_batch_size=None,
                     gen_col_names=None, env_col_names=None,
                     conformal_alpha=0.10,
+                    conformal_calibration=None,
                     log_wandb=True):
         """
         Full evaluation pipeline (call after training, with best weights loaded).
@@ -1148,6 +1225,8 @@ class Tester:
                                 at the cost of more forward/backward passes.
         gen_col_names  : list[str] | None  genetic dummy column names
         env_col_names  : list[str] | None  environmental feature column names
+        conformal_calibration : pd.DataFrame | None  Bounds fitted on an
+                       independent inner-validation mask
         """
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -1157,11 +1236,21 @@ class Tester:
         test_indices = torch.where(data.test_mask)[0]
         species_names = [data.species_names[i] for i in test_indices.cpu().numpy()]
 
+        
+
         # == Part 1: Leave-one-trait-out ==============================
         print("\n====== Part 1: Leave-one-trait-out evaluation ======")
         ret = leave_one_trait_out(model, data, test_indices, device)
         trait_mode = ret['mode']
         self.trait_mode = trait_mode
+
+        if trait_mode == 'mean_std':
+            var_names = ['mean', 'std']
+        else:
+            var_names = ['min', 'max', 'range']
+            if not hasattr(data, 'species_x_range'):
+                var_names.remove('range')
+        
 
         if trait_mode == 'mean_std':
             pred_mean = ret['pred_mean']
@@ -1173,13 +1262,18 @@ class Tester:
         else:
             pred_min = ret['pred_min']
             pred_max = ret['pred_max']
-            pred_range = ret['pred_range']
             eval_mask = ret['eval_mask']
             true_min = data.species_x_min[test_indices]
             true_max = data.species_x_max[test_indices]
-            true_range = data.species_x_range[test_indices]
-            # -- normalised-space metrics for min/max/range --
+            if 'range' in var_names:
+                pred_range = ret['pred_range']
+                true_range = data.species_x_range[test_indices]
+            else:
+                pred_range = None
+                true_range = None
+            # -- normalised-space metrics for min/max(/range) --
             metrics = compute_metrics_minmax(pred_min, pred_max, pred_range, true_min, true_max, true_range, eval_mask, trait_names)
+
         if trait_mode == 'mean_std':
             num_cols = [
                 "RMSE", "MAE", "Pearson_r", "Spearman_rho",
@@ -1205,15 +1299,17 @@ class Tester:
             d_tmp = data.clone().cpu()
             d_tmp.species_x_mean = pred_mean.cpu()
             d_tmp.species_x_std = pred_std.cpu()
-            d_unnorm = norm_transform.inverse(d_tmp, soft_clip=True)
+            d_unnorm = norm_transform.inverse(d_tmp, warn=False, soft_clip=True)
             inv_pred = d_unnorm.species_x_mean
             inv_std = d_unnorm.species_x_std
-            inv_true = norm_transform.inverse(data.clone().cpu()).species_x_mean[test_indices.cpu()]
+            inv_true = norm_transform.inverse(data.clone().cpu(), warn=False).species_x_mean[test_indices.cpu()]
 
             metrics_orig = compute_metrics(inv_pred, inv_std, inv_true, eval_mask.cpu(), trait_names)
             metrics_orig.to_csv(save_dir / "per_trait_metrics_original.csv", index=False)
 
-            conformal_bounds, conformal_reliable_mask = compute_conformal_residual_bounds(inv_pred, inv_std, inv_true, eval_mask.cpu(), trait_names, alpha=conformal_alpha)
+            conformal_bounds, conformal_reliable_mask = apply_conformal_residual_bounds(
+                inv_pred, inv_std, inv_true, eval_mask.cpu(), trait_names, conformal_calibration,
+            )
             conformal_bounds.to_csv(save_dir / "conformal_residual_bounds.csv", index=False)
             self.conformal_bounds = conformal_bounds
             self.conformal_reliable_mask = conformal_reliable_mask
@@ -1222,26 +1318,34 @@ class Tester:
             # min_max_range branch: save raw normalized predictions
             pd.DataFrame(pred_min.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_min.csv")
             pd.DataFrame(pred_max.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_max.csv")
-            pd.DataFrame(pred_range.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_range.csv")
+
+            if 'range' in var_names:
+                pd.DataFrame(pred_range.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_range.csv")
 
             # -- original-space metrics --
             d_tmp = data.clone().cpu()
             d_tmp.species_x_min = pred_min.cpu()
             d_tmp.species_x_max = pred_max.cpu()
-            d_tmp.species_x_range = pred_range.cpu()
-            d_unnorm = norm_transform.inverse(d_tmp, soft_clip=True)
+            if pred_range is not None:
+                d_tmp.species_x_range = pred_range.cpu()
+            d_unnorm = norm_transform.inverse(d_tmp, warn=False, soft_clip=True)
             inv_min = d_unnorm.species_x_min
             inv_max = d_unnorm.species_x_max
-            inv_range = d_unnorm.species_x_range
-            data_unnorm = norm_transform.inverse(data.clone().cpu())
+            
+            inv_range = d_unnorm.species_x_range if pred_range is not None else None
+            data_unnorm = norm_transform.inverse(data.clone().cpu(), warn=False)
             true_min_unn = data_unnorm.species_x_min[test_indices.cpu()]
             true_max_unn = data_unnorm.species_x_max[test_indices.cpu()]
-            true_range_unn = data_unnorm.species_x_range[test_indices.cpu()]
+            true_range_unn = data_unnorm.species_x_range[test_indices.cpu()] if pred_range is not None else None
+
 
             metrics_orig = compute_metrics_minmax(inv_min, inv_max, inv_range, true_min_unn, true_max_unn, true_range_unn, eval_mask.cpu(), trait_names)
             metrics_orig.to_csv(save_dir / "per_trait_metrics_original.csv", index=False)
 
-            conformal_bounds, conformal_reliable_mask = compute_conformal_residual_bounds_minmax(inv_min, inv_max, inv_range, true_min_unn, true_max_unn, true_range_unn, eval_mask.cpu(), trait_names, alpha=conformal_alpha)
+            conformal_bounds, conformal_reliable_mask = apply_conformal_residual_bounds_minmax(
+                inv_min, inv_max, inv_range, true_min_unn, true_max_unn, true_range_unn,
+                eval_mask.cpu(), trait_names, conformal_calibration,
+            )
             conformal_bounds.to_csv(save_dir / "conformal_residual_bounds.csv", index=False)
             self.conformal_bounds = conformal_bounds
             self.conformal_reliable_mask = conformal_reliable_mask
@@ -1271,13 +1375,14 @@ class Tester:
 
             orig_min_df = pd.DataFrame(inv_min.cpu().numpy(), index=species_names, columns=trait_names)
             orig_max_df = pd.DataFrame(inv_max.cpu().numpy(), index=species_names, columns=trait_names)
-            orig_range_df = pd.DataFrame(inv_range.cpu().numpy(), index=species_names, columns=trait_names)
             orig_min_df.to_csv(save_dir / "predictions_min_original.csv")
             orig_max_df.to_csv(save_dir / "predictions_max_original.csv")
-            orig_range_df.to_csv(save_dir / "predictions_range_original.csv")
             self._orig_min_dfs.append(orig_min_df)
             self._orig_max_dfs.append(orig_max_df)
-            self._orig_range_dfs.append(orig_range_df)
+            if inv_range is not None:
+                orig_range_df = pd.DataFrame(inv_range.cpu().numpy(), index=species_names, columns=trait_names)
+                orig_range_df.to_csv(save_dir / "predictions_range_original.csv")
+                self._orig_range_dfs.append(orig_range_df)
 
         # -- plots (Part 1) --
         if trait_mode == 'mean_std':
@@ -1289,11 +1394,14 @@ class Tester:
             # For min/max/range, produce variable-specific scatter plots
             _plot_scatter_pred_vs_true(pred_min, true_min, eval_mask, trait_names, save_dir / "scatter_pred_vs_true_min.png")
             _plot_scatter_pred_vs_true(pred_max, true_max, eval_mask, trait_names, save_dir / "scatter_pred_vs_true_max.png")
-            _plot_scatter_pred_vs_true(pred_range, true_range, eval_mask, trait_names, save_dir / "scatter_pred_vs_true_range.png")
             paths_min = _plot_scatter_pred_vs_true_per_trait(pred_min, true_min, eval_mask, trait_names, save_dir / "scatterplots_min")
             paths_max = _plot_scatter_pred_vs_true_per_trait(pred_max, true_max, eval_mask, trait_names, save_dir / "scatterplots_max")
-            paths_range = _plot_scatter_pred_vs_true_per_trait(pred_range, true_range, eval_mask, trait_names, save_dir / "scatterplots_range")
-            self.scatterplot_paths = paths_min + paths_max + paths_range
+            self.scatterplot_paths = paths_min + paths_max 
+
+            if pred_range is not None:
+                _plot_scatter_pred_vs_true(pred_range, true_range, eval_mask, trait_names, save_dir / "scatter_pred_vs_true_range.png")
+                paths_range = _plot_scatter_pred_vs_true_per_trait(pred_range, true_range, eval_mask, trait_names, save_dir / "scatterplots_range")
+                self.scatterplot_paths += paths_range
 
         if log_wandb and wandb.run is not None:
             wandb_scatter_logs = {}
@@ -1309,7 +1417,11 @@ class Tester:
                     safe_trait_name = str(trait_name).replace("/", "_")
                     wandb_scatter_logs[f"scatter/{j:03d}_{safe_trait_name}"] = wandb.plot.scatter(table, "x", "y", title=f"{trait_name} predicted vs true")
             else:
-                for var_name, p, t in [('min', pred_min, true_min), ('max', pred_max, true_max), ('range', pred_range, true_range)]:
+                var_targets = [('min', pred_min, true_min), ('max', pred_max, true_max)]
+                if 'range' in var_names:
+                    var_targets.append(('range', pred_range, true_range))
+
+                for var_name, p, t in var_targets:
                     for j, trait_name in enumerate(trait_names):
                         m = eval_mask[:, j]
                         if m.sum() < 2:
@@ -1337,6 +1449,7 @@ class Tester:
             sp_attr = _species_ig(
                 model, data, test_indices, trait_names, device,
                 n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size, gen_col_names=gen_col_names,
+                var_names=var_names
             )
             sp_attr.to_csv(save_dir / "attributions_species.csv", index=False)
             _plot_attribution_heatmap(
@@ -1358,6 +1471,7 @@ class Tester:
                 sa_attr = _spatial_ig(
                     model, data, test_indices, trait_names,
                     env_col_names, device, n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size,
+                    var_names=var_names
                 )
                 sa_attr.to_csv(save_dir / "attributions_spatial.csv", index=False)
                 _plot_attribution_heatmap(
@@ -1368,6 +1482,13 @@ class Tester:
                 print(f"  Spatial attributions saved  ({len(sa_attr)} rows).")
             else:
                 print("  Spatial IG skipped (use_env_features=False).")
+
+            (save_dir / "attributions_metadata.json").write_text(json.dumps({
+                "protocol": "leave_one_trait_out_target_masked",
+                "target_trait_masked": True,
+                "trait_representation": trait_mode,
+                "n_ig_steps": n_ig_steps,
+            }, indent=2))
 
         print(f"\nAll results saved to  {save_dir}/")
         if self.metrics.empty:
@@ -1381,10 +1502,12 @@ class Tester:
             else:
                 self.pred_min = pred_min
                 self.pred_max = pred_max
-                self.pred_range = pred_range
                 self.true_min = true_min
                 self.true_max = true_max
-                self.true_range = true_range
+
+                if 'range' in var_names:
+                    self.pred_range = pred_range
+                    self.true_range = true_range
             self.eval_mask = eval_mask
         else:
             self.metrics = pd.concat([self.metrics, metrics], ignore_index=True)
@@ -1399,10 +1522,11 @@ class Tester:
             else:
                 self.pred_min = torch.cat([getattr(self, 'pred_min', torch.empty(0)), pred_min], dim=0) if getattr(self, 'pred_min', None) is not None else pred_min
                 self.pred_max = torch.cat([getattr(self, 'pred_max', torch.empty(0)), pred_max], dim=0) if getattr(self, 'pred_max', None) is not None else pred_max
-                self.pred_range = torch.cat([getattr(self, 'pred_range', torch.empty(0)), pred_range], dim=0) if getattr(self, 'pred_range', None) is not None else pred_range
                 self.true_min = torch.cat([getattr(self, 'true_min', torch.empty(0)), true_min], dim=0) if getattr(self, 'true_min', None) is not None else true_min
                 self.true_max = torch.cat([getattr(self, 'true_max', torch.empty(0)), true_max], dim=0) if getattr(self, 'true_max', None) is not None else true_max
-                self.true_range = torch.cat([getattr(self, 'true_range', torch.empty(0)), true_range], dim=0) if getattr(self, 'true_range', None) is not None else true_range
+                if pred_range is not None and true_range is not None:
+                    self.pred_range = torch.cat([getattr(self, 'pred_range', torch.empty(0)), pred_range], dim=0) if getattr(self, 'pred_range', None) is not None else pred_range
+                    self.true_range = torch.cat([getattr(self, 'true_range', torch.empty(0)), true_range], dim=0) if getattr(self, 'true_range', None) is not None else true_range
             self.eval_mask = torch.cat([self.eval_mask, eval_mask], dim=0) if self.eval_mask is not None else eval_mask
 
         return metrics
@@ -1415,11 +1539,14 @@ class Tester:
             save_dir.mkdir(parents=True, exist_ok=True)
             merged_min = pd.concat(self._orig_min_dfs)
             merged_max = pd.concat(self._orig_max_dfs)
-            merged_range = pd.concat(self._orig_range_dfs)
             merged_min_renamed = merged_min.add_suffix("_min")
             merged_max_renamed = merged_max.add_suffix("_max")
-            merged_range_renamed = merged_range.add_suffix("_range")
-            merged = merged_min_renamed.join(merged_max_renamed).join(merged_range_renamed)
+            merged = merged_min_renamed.join(merged_max_renamed)
+
+            if len(self._orig_range_dfs) > 0:
+                merged_range = pd.concat(self._orig_range_dfs)
+                merged_range_renamed = merged_range.add_suffix("_range")
+                merged = merged.join(merged_range_renamed)
             merged.index.name = "species"
             merged.to_csv(save_dir / "predictions_original_all_folds.csv")
             print(f"Merged original-space predictions saved to {save_dir}/predictions_original_all_folds.csv")
@@ -1471,8 +1598,3 @@ class Tester:
                 getattr(self, 'true_min', torch.empty(0)), getattr(self, 'true_max', torch.empty(0)), getattr(self, 'true_range', torch.empty(0)),
                 self.eval_mask, sorted(set(self.metrics['trait'].tolist())), sp_attr=self.sp_attr, sa_attr=self.sa_attr,
             )
-        # sanity_check_results(
-        #     metrics, pred_mean, pred_std, true_mean, eval_mask, trait_names,
-        #     sp_attr=sp_attr,
-        #     sa_attr=sa_attr,
-        # )
