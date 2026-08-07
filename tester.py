@@ -437,10 +437,10 @@ def _species_ig(model, data, test_indices, trait_names, device,
 
 
     for i, x_var in enumerate(var_names):
-        assert getattr(data, f"species_x_{x_var}").size(0) == n_species_nodes, \
-            f"species_x_{x_var} rows {getattr(data, f'species_x_{x_var}').size(0)} != species_num_nodes {n_species_nodes}"
+        assert data[f'species_x_{x_var}'].size(0) == n_species_nodes, \
+            f"species_x_{x_var} rows {data[f'species_x_{x_var}'].size(0)} != species_num_nodes {n_species_nodes}"
         if i > 0:
-            n_i = data.species_x_std.size(1)
+            n_i = data[f'species_x_{x_var}'].size(1)
             assert n_traits == n_i, \
                 f"trait {var_names[0]}/{var_names[i]} column-count mismatch: {n_traits} vs {n_i}"
 
@@ -562,11 +562,15 @@ def _species_ig(model, data, test_indices, trait_names, device,
     ig = IntegratedGradients(forward_fn)
 
     # column names
-    g_cols = (
-        [f"gen_{c}" for c in gen_col_names]
-        if gen_col_names is not None
-        else [f"gen_{i}" for i in range(n_gen)]
-    )
+    if gen_col_names is not None and len(gen_col_names) == n_gen:
+        g_cols = [f"gen_{column}" for column in gen_col_names]
+    else:
+        if gen_col_names is not None:
+            warnings.warn(
+                f"Received {len(gen_col_names)} genetic feature names for "
+                f"{n_gen} species_x_gen columns; using positional names instead."
+            )
+        g_cols = [f"gen_{index}" for index in range(n_gen)]
     phylo_cols = [f"phylo_{i}" for i in range(n_phylo)]
 
     all_cols = []
@@ -683,7 +687,7 @@ def _spatial_ig(model, data, test_indices, trait_names,
             dtmp.spatial_x, dtmp.spatial_global_data = torch.split(
                 chunk, [n_spatial_x, chunk.size(1) - n_spatial_x], dim=1
             )
-            _mask_target_trait_for_imputation(dtmp, test_indices, active_target_trait[0], trait_mode)
+            _mask_target_trait_for_imputation(dtmp, test_indices, active_target_trait[0], var_names)
             dtmp.num_nodes = n_sp_nodes + n_sa_nodes
             if first_call and i == 0:
                 expected_pivot = data_dev[pivot_variable].detach().clone()
