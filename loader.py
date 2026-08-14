@@ -279,12 +279,34 @@ class PlantDataset(InMemoryDataset):
         self.load(self.processed_paths[0])
     
     @staticmethod
-    def load_raster(f, grid_step=.1):
+    def load_raster(f, grid_step=.1, max_window_pixels=1_000_000):
         raster = xr.open_dataarray(f, engine="rasterio")
-        current_step = (raster.x[1] - raster.x[0]).values # degrees
-        downsample = round(grid_step / current_step)
-        raster = raster.coarsen(x=downsample, y=downsample, boundary="trim").sum().fillna(0) # type: ignore
-        return raster
+        current_step = abs(float((raster.x[1] - raster.x[0]).values))  # degrees
+        downsample = max(1, round(grid_step / current_step))
+
+        # Rasterio-backed xarray data is loaded eagerly by coarsen().sum(). Process
+        # row windows instead, keeping the largest intermediate array bounded.
+        height = raster.sizes['y']
+        width = raster.sizes['x']
+        trimmed_height = height - height % downsample
+        trimmed_width = width - width % downsample
+        if not trimmed_height or not trimmed_width:
+            raise ValueError(
+                f'Raster {f} is smaller than one {downsample}x{downsample} aggregation cell.'
+            )
+
+        rows_per_window = max(
+            downsample,
+            (max_window_pixels // trimmed_width // downsample) * downsample,
+        )
+        chunks = []
+        for start in range(0, trimmed_height, rows_per_window):
+            stop = min(start + rows_per_window, trimmed_height)
+            window = raster.isel(y=slice(start, stop), x=slice(0, trimmed_width)).load()
+            chunks.append(
+                window.coarsen(x=downsample, y=downsample, boundary='trim').sum().fillna(0) # type: ignore
+            )
+        return xr.concat(chunks, dim='y')
     
     
     def get_traits_df(self, root, dummy_threshold=0.05, drop_threshold=0.7,

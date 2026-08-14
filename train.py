@@ -28,6 +28,22 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
+def resolve_checkpoint_path(load_checkpoint: str | Path | None, output_dir: Path, fold: int) -> Path:
+    """Resolve the checkpoint requested by the optional load flag.
+
+    A directory (including the default empty value from ``--load_checkpoint``)
+    contains the fold-specific checkpoint produced by training. Explicit file
+    paths are kept unchanged for backwards compatibility.
+    """
+    if load_checkpoint is None:
+        raise ValueError('A checkpoint path can only be resolved when loading is requested.')
+
+    checkpoint_path = output_dir if str(load_checkpoint) == '' else Path(load_checkpoint)
+    if checkpoint_path.is_dir() or checkpoint_path.suffix == '':
+        checkpoint_path = checkpoint_path / f'best_model_{fold}.pth'
+    return checkpoint_path
+
 torch.set_float32_matmul_precision('medium')
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -97,10 +113,19 @@ def get_args():
     parser.add_argument('--visible_loss_weight', type=float, default=0.2, help='Weight for the reconstruction loss on visible (non-masked) entries')
     parser.add_argument('--validation_mask_ratio', type=float, default=0.15, help='Fraction of observed outer-training cells held out for checkpoint selection')
     parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping (0 to disable)')
-    parser.add_argument('--compute_xai', type=str2bool, nargs='?', const=True, default=False, help='Whether to compute XAI attributions during testing (can be slow)')
+    parser.add_argument('--compute_xai', type=str2bool, nargs='?', const=True, default=True, help='Whether to compute XAI attributions during testing (can be slow)')
 
     parser.add_argument('--test_logging_step', type=int, default=1, help='Step for test logging')
     parser.add_argument('--save_model', type=str2bool, nargs='?', const=True, default=True, help='Save the best fold checkpoint (default: true)')
+    parser.add_argument(
+        '--load_checkpoint',
+        type=str,
+        nargs='?',
+        const='',
+        default=None,
+        metavar='PATH',
+        help='Load a checkpoint and skip training; defaults to best_model_<fold>.pth in --output_dir (a directory may also be supplied)',
+    )
     parser.add_argument('--use_wb', type=str2bool, default=False, nargs='?', const=True, help='Use Weights & Biases for logging')
     parser.add_argument('--run_optuna', action='store_true', help='Run an Optuna sweep from a sweep YAML file')
     parser.add_argument('--optuna_sweep', type=str, default=None, help='Path to Optuna sweep YAML file (grid format)')
@@ -147,6 +172,7 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
         trait_feature_keys = ['species_x_min', 'species_x_max', 'species_x_range']
         if not args.keep_range_features:
             trait_feature_keys.remove('species_x_range')
+            data.pop('species_x_range')
 
     model = TraitsPredictor(in_traits=len(trait_names), in_gen=data.species_x_gen.size(1), in_phylo=data.species_x_phylo.size(1),  # type: ignore
                             in_space=data.spatial_global_data.size(1), out_channels=len(trait_names),  # type: ignore
@@ -195,120 +221,138 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
                                per_trait_reduction=args.per_trait_loss)
     
     best_validation_loss = float('inf')
+    best_validation_rmse = float('nan')
+    best_validation_correlation = float('nan')
     best_model = None
     best_epoch = 0
 
-    for epoch in trange(args.epochs, desc="Training", unit="epoch"):
-        model.train()
-        optimizer.zero_grad()
-        
-        predictions = model(train_data)
-        train_targets = tuple(getattr(train_data, key) for key in trait_feature_keys)
-
-        observed_mask = ~train_data.traits_nanmask
-        if model.reconstruction_mask is not None:
-            masked_entries = model.reconstruction_mask  # True where observed traits were masked
-            visible_entries = observed_mask & ~masked_entries  # True where observed traits are still visible
-            # Full loss on masked entries (the primary denoising objective)
-            if args.trait_representation == 'mean_std':
-                loss_masked = loss_fn(*predictions, *train_targets, masked_entries)
-                loss_visible = loss_fn(*predictions, *train_targets, visible_entries)
-            else:
-                loss_masked = loss_fn(predictions, train_targets, masked_entries)
-                loss_visible = loss_fn(predictions, train_targets, visible_entries)
-            # Down-weighted loss on visible entries (dense gradient signal)
-            loss = loss_masked + args.visible_loss_weight * loss_visible
+    if args.load_checkpoint is not None:
+        checkpoint_path = resolve_checkpoint_path(args.load_checkpoint, args.output_dir, args.k)
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+            state_dict = checkpoint['state_dict']
+        elif isinstance(checkpoint, dict) and any(key.startswith('model.') or key.startswith('module.') for key in checkpoint):
+            state_dict = checkpoint
         else:
-            loss = (
-                loss_fn(*predictions, *train_targets, observed_mask)
-                if args.trait_representation == 'mean_std'
-                else loss_fn(predictions, train_targets, observed_mask)
-            )
+            state_dict = checkpoint
+        model.load_state_dict(state_dict, strict=False)
+        print("Checkpoint loaded; skipping training and proceeding to evaluation.")
+    else:
+        for epoch in trange(args.epochs, desc="Training", unit="epoch"):
+            model.train()
+            optimizer.zero_grad()
+            
+            predictions = model(train_data)
+            train_targets = tuple(getattr(train_data, key) for key in trait_feature_keys)
 
-        # add graph smothness loss
-        smoothness_prediction = predictions[0] if args.trait_representation == 'mean_std' else torch.cat(predictions, dim=1)
-        gs_loss = graph_smoothness_loss(smoothness_prediction, train_data.species_species_edge_index) * args.smoothness_weight
-        loss += gs_loss
-        
-        if torch.isnan(loss):
-            raise ValueError("Loss is NaN. Training stopped.")
-
-        loss.backward()
-
-        if args.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step(None) if args.scheduler != 'plateau' else scheduler.step(loss)  # type: ignore
-
-        log_dict = {
-            'train_loss': loss.item(), 
-            'graph_smoothness_loss': gs_loss.item(),
-            'lr': optimizer.param_groups[0]['lr'],
-            } | loss_fn.cache
-        if args.use_wb:
-            wandb.log(log_dict, step=epoch)
-        
-        if epoch % args.test_logging_step == 0:
-            model.eval()
-            with torch.no_grad():
-                predictions = model(validation_data)
-                validation_loss = (
-                    loss_fn(*predictions, *validation_targets, validation_mask)
+            observed_mask = ~train_data.traits_nanmask
+            if model.reconstruction_mask is not None:
+                masked_entries = model.reconstruction_mask  # True where observed traits were masked
+                visible_entries = observed_mask & ~masked_entries  # True where observed traits are still visible
+                # Full loss on masked entries (the primary denoising objective)
+                if args.trait_representation == 'mean_std':
+                    loss_masked = loss_fn(*predictions, *train_targets, masked_entries)
+                    loss_visible = loss_fn(*predictions, *train_targets, visible_entries)
+                else:
+                    loss_masked = loss_fn(predictions, train_targets, masked_entries)
+                    loss_visible = loss_fn(predictions, train_targets, visible_entries)
+                # Down-weighted loss on visible entries (dense gradient signal)
+                loss = loss_masked + args.visible_loss_weight * loss_visible
+            else:
+                loss = (
+                    loss_fn(*predictions, *train_targets, observed_mask)
                     if args.trait_representation == 'mean_std'
-                    else loss_fn(predictions, validation_targets, validation_mask)
+                    else loss_fn(predictions, train_targets, observed_mask)
                 )
 
-                primary_prediction, primary_target = predictions[0], validation_targets[0]
-                validation_rmse = F.mse_loss(
-                    primary_prediction[validation_mask], primary_target[validation_mask], reduction='mean'
-                ).sqrt()
-                correlation_target = primary_target.clone()
-                correlation_target[~validation_mask] = float('nan')
-                correlation = compute_correlation(primary_prediction, correlation_target)
+            # add graph smothness loss
+            smoothness_prediction = predictions[0] if args.trait_representation == 'mean_std' else torch.cat(predictions, dim=1)
+            gs_loss = graph_smoothness_loss(smoothness_prediction, train_data.species_species_edge_index) * args.smoothness_weight
+            loss += gs_loss
+            
+            if torch.isnan(loss):
+                raise ValueError("Loss is NaN. Training stopped.")
 
-                if validation_loss.item() < best_validation_loss:
-                    best_validation_loss = validation_loss.item()
-                    best_validation_rmse = validation_rmse.item() if not torch.isnan(validation_rmse) else float('nan')
-                    best_validation_correlation = float(correlation)
-                    best_epoch = epoch
-                    best_model = deepcopy(model.state_dict())
-                
-                log_dict = {
-                    'validation_loss': validation_loss.item(),
-                    'validation_mean_rmse': validation_rmse.item() if not torch.isnan(validation_rmse) else float('nan'),
-                    'validation_correlation': float(correlation),
-                    'lr': optimizer.param_groups[0]['lr'],
+            loss.backward()
+
+            if args.max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step(None) if args.scheduler != 'plateau' else scheduler.step(loss)  # type: ignore
+
+            log_dict = {
+                'train_loss': loss.item(), 
+                'graph_smoothness_loss': gs_loss.item(),
+                'lr': optimizer.param_groups[0]['lr'],
                 } | loss_fn.cache
-                if args.use_wb:
-                    wandb.log(log_dict, step=epoch)
+            if args.use_wb:
+                wandb.log(log_dict, step=epoch)
+            
+            if epoch % args.test_logging_step == 0:
+                model.eval()
+                with torch.no_grad():
+                    predictions = model(validation_data)
+                    validation_loss = (
+                        loss_fn(*predictions, *validation_targets, validation_mask)
+                        if args.trait_representation == 'mean_std'
+                        else loss_fn(predictions, validation_targets, validation_mask)
+                    )
 
-                # Report objective metric to Optuna when running under a trial
-                if trial is not None:
-                    try:
-                        trial.report(float(validation_rmse.item()), epoch)
-                        if trial.should_prune():
-                            raise optuna.TrialPruned()
-                    except Exception:
-                        # ignore reporting errors for compatibility with non-pruning samplers
-                        pass
+                    primary_prediction, primary_target = predictions[0], validation_targets[0]
+                    validation_rmse = F.mse_loss(
+                        primary_prediction[validation_mask], primary_target[validation_mask], reduction='mean'
+                    ).sqrt()
+                    correlation_target = primary_target.clone()
+                    correlation_target[~validation_mask] = float('nan')
+                    correlation = compute_correlation(primary_prediction, correlation_target)
 
-    args.output_dir.mkdir(exist_ok=True, parents=True)        
-    if args.save_model:
-        torch.save(best_model, args.output_dir / f'best_model_{args.k}.pth')
-    
-    # Print final metrics at best epoch
-    print(f"\nBest validation loss: {best_validation_loss:.4f} at epoch {best_epoch}")
-    print(f"\t Mean RMSE: {best_validation_rmse:.4f}")
-    print(f"\t Correlation: {best_validation_correlation:.4f}")
+                    if validation_loss.item() < best_validation_loss:
+                        best_validation_loss = validation_loss.item()
+                        best_validation_rmse = validation_rmse.item() if not torch.isnan(validation_rmse) else float('nan')
+                        best_validation_correlation = float(correlation)
+                        best_epoch = epoch
+                        best_model = deepcopy(model.state_dict())
+                    
+                    log_dict = {
+                        'validation_loss': validation_loss.item(),
+                        'validation_mean_rmse': validation_rmse.item() if not torch.isnan(validation_rmse) else float('nan'),
+                        'validation_correlation': float(correlation),
+                        'lr': optimizer.param_groups[0]['lr'],
+                    } | loss_fn.cache
+                    if args.use_wb:
+                        wandb.log(log_dict, step=epoch)
 
-    if args.use_wb:
-        wandb.log({'best_validation_loss': best_validation_loss}, step=best_epoch)
+                    # Report objective metric to Optuna when running under a trial
+                    if trial is not None:
+                        try:
+                            trial.report(float(validation_rmse.item()), epoch)
+                            if trial.should_prune():
+                                raise optuna.TrialPruned()
+                        except Exception:
+                            # ignore reporting errors for compatibility with non-pruning samplers
+                            pass
 
-    # ensure best model is loaded for final evaluation
-    if best_model is not None:
-        model.load_state_dict(best_model)
+        args.output_dir.mkdir(exist_ok=True, parents=True)        
+        if args.save_model:
+            torch.save(best_model, args.output_dir / f'best_model_{args.k}.pth')
+        
+        # Print final metrics at best epoch
+        print(f"\nBest validation loss: {best_validation_loss:.4f} at epoch {best_epoch}")
+        print(f"\t Mean RMSE: {best_validation_rmse:.4f}")
+        print(f"\t Correlation: {best_validation_correlation:.4f}")
+
+        if args.use_wb:
+            wandb.log({'best_validation_loss': best_validation_loss}, step=best_epoch)
+
+        # ensure best model is loaded for final evaluation
+        if best_model is not None:
+            model.load_state_dict(best_model)
+
+    if args.load_checkpoint is not None:
+        print(f"Loaded checkpoint metrics unavailable; proceeding directly to full evaluation.")
 
     model.eval()
     with torch.no_grad():
@@ -334,16 +378,17 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
     else:
         calibration_data.species_x_min = calibration_predictions[0].cpu()
         calibration_data.species_x_max = calibration_predictions[1].cpu()
-        calibration_data.species_x_range = calibration_predictions[2].cpu()
+        if args.keep_range_features:
+            calibration_data.species_x_range = calibration_predictions[2].cpu()
         calibration_unnormalized = norm_transform.inverse(calibration_data, warn=False, soft_clip=True)
         calibration_truth = norm_transform.inverse(calibration_truth_data, warn=False)
         conformal_calibration = fit_conformal_residual_bounds_minmax(
             calibration_unnormalized.species_x_min,
             calibration_unnormalized.species_x_max,
-            calibration_unnormalized.species_x_range,
+            calibration_unnormalized.species_x_range if args.keep_range_features else None,
             calibration_truth.species_x_min,
             calibration_truth.species_x_max,
-            calibration_truth.species_x_range,
+            calibration_truth.species_x_range if args.keep_range_features else None,
             validation_mask.cpu(),
             trait_names,
         )
@@ -471,7 +516,7 @@ if __name__ == "__main__":
 
         # Finally, concatenate all csv files in results/fold_*/ {attributions_spatial, attributions_species, predictions_mean, predictions_std} into single csv files in results/ for easier analysis
         tester.save_merged_original_predictions(args.output_dir)
-        prediction_file_types = ['predictions_mean', 'predictions_std'] if args.trait_representation == 'mean_std' else ['predictions_min', 'predictions_max', 'predictions_range']
+        prediction_file_types = [f'predictions_{var_n}' for var_n in tester.trait_mode.split('_')]
         if args.compute_xai:
             prediction_file_types += ['attributions_species']
             if args.use_env_features:

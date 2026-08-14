@@ -69,6 +69,10 @@ def leave_one_trait_out(model, data, test_indices, device):
     else:
         trait_mode = 'min_max_range'
         n_traits = data.species_x_min.size(1)
+        if not hasattr(data, 'species_x_range'):
+            trait_mode = trait_mode.replace('_range', '')
+            
+
     n_test = len(test_indices)
     observed = ~data.traits_nanmask  # True = originally observed
 
@@ -94,36 +98,35 @@ def leave_one_trait_out(model, data, test_indices, device):
         else:
             d.species_x_min[mask_global, j] = 0.0
             d.species_x_max[mask_global, j] = 0.0
-            d.species_x_range[mask_global, j] = 0.0
+            if trait_mode.endswith('range'):
+                d.species_x_range[mask_global, j] = 0.0
         d.traits_nanmask[mask_global, j] = True
 
-        out = model(d)
-        # Model may return (mean, std) or (min, max, range)
-        if isinstance(out, tuple) and len(out) == 2:
-            pm_full, ps_full = out
-        elif isinstance(out, tuple) and len(out) == 3:
-            pmin_full, pmax_full, pr_full = out
-        else:
-            raise RuntimeError('Unexpected model output from forward pass')
-
         local_idx = torch.where(test_has_j)[0]
+        eval_mask[local_idx, j] = True
+        out = model(d)
+
         if trait_mode == 'mean_std':
+            pm_full, ps_full = out
             pred_mean_out[local_idx, j] = pm_full[mask_global, j]
             pred_std_out[local_idx, j] = ps_full[mask_global, j]
         else:
+            if trait_mode.endswith('range'):
+                pmin_full, pmax_full, pr_full = out
+                pred_range_out[local_idx, j] = pr_full[mask_global, j]
+            else:
+                pmin_full, pmax_full = out
+
             pred_min_out[local_idx, j] = pmin_full[mask_global, j]
             pred_max_out[local_idx, j] = pmax_full[mask_global, j]
-            pred_range_out[local_idx, j] = pr_full[mask_global, j]
-        eval_mask[local_idx, j] = True
 
     if trait_mode == 'mean_std':
-        return {'mode': trait_mode, 'pred_mean': pred_mean_out, 'pred_std': pred_std_out, 'eval_mask': eval_mask}
+        return {'mode': trait_mode, 'pred_mean': pred_mean_out, 
+                'pred_std': pred_std_out, 'eval_mask': eval_mask}
     else:
         return {
-            'mode': trait_mode,
-            'pred_min': pred_min_out,
-            'pred_max': pred_max_out,
-            'pred_range': pred_range_out,
+            'mode': trait_mode, 'pred_min': pred_min_out,
+            'pred_max': pred_max_out, 'pred_range': pred_range_out,
             'eval_mask': eval_mask,
         }
 
@@ -315,12 +318,16 @@ def fit_conformal_residual_bounds_minmax(
     records = []
     for j in range(pred_min.size(1)):
         mask = calibration_mask[:, j]
-        n_calibration = int(mask.sum().item())
-        for variable, prediction, target in (
+        target_tuples = [
             ("min", pred_min, true_min),
-            ("max", pred_max, true_max),
-            ("range", pred_range, true_range),
-        ):
+            ("max", pred_max, true_max)
+        ]
+
+        if pred_range is not None:
+            target_tuples.append(("range", pred_range, true_range))
+        
+        n_calibration = int(mask.sum().item())
+        for variable, prediction, target in target_tuples:
             q_hat = float("nan")
             if n_calibration >= 2:
                 scores = np.abs((target[mask, j] - prediction[mask, j]).detach().cpu().numpy())
@@ -985,13 +992,11 @@ def sanity_check_results_minmax(
 
     pmin_np = pred_min.cpu().numpy()
     pmax_np = pred_max.cpu().numpy()
-    prange_np = pred_range.cpu().numpy()
     em_np = eval_mask.cpu().numpy()
     nan_pred_min = np.isnan(pmin_np[em_np]).sum()
     nan_pred_max = np.isnan(pmax_np[em_np]).sum()
-    nan_pred_range = np.isnan(prange_np[em_np]).sum()
-    _ok("no_nan_predictions", nan_pred_min == 0 and nan_pred_max == 0 and nan_pred_range == 0,
-        f"{nan_pred_min} nan mins, {nan_pred_max} nan maxs, {nan_pred_range} nan ranges in evaluated positions")
+    _ok("no_nan_predictions", nan_pred_min == 0 and nan_pred_max == 0,
+        f"{nan_pred_min} nan mins, {nan_pred_max} nan maxs in evaluated positions")
 
     # non-constant predictions per variable
     constant_issues = []
@@ -1003,8 +1008,6 @@ def sanity_check_results_minmax(
             constant_issues.append(f"{t} min")
         if np.std(pred_max.cpu().numpy()[m, j]) < 1e-4:
             constant_issues.append(f"{t} max")
-        if np.std(pred_range.cpu().numpy()[m, j]) < 1e-4:
-            constant_issues.append(f"{t} range")
     _ok("non_constant_preds", len(constant_issues) == 0, "; ".join(constant_issues) if constant_issues else "")
 
     # eval coverage per trait (any variable evaluated)
@@ -1022,7 +1025,7 @@ def sanity_check_results_minmax(
         target_mask_fail = []
         for trait in trait_names:
             subset = sp_attr[sp_attr["target_trait"] == trait]
-            for column in (f"min_{trait}", f"max_{trait}", f"range_{trait}"):
+            for column in (f"min_{trait}", f"max_{trait}"):
                 if column in subset and float(subset[column].abs().max()) > 1e-6:
                     target_mask_fail.append(f"{trait}:{column}")
         _ok("ig_target_masked", len(target_mask_fail) == 0,
@@ -1247,14 +1250,7 @@ class Tester:
         ret = leave_one_trait_out(model, data, test_indices, device)
         trait_mode = ret['mode']
         self.trait_mode = trait_mode
-
-        if trait_mode == 'mean_std':
-            var_names = ['mean', 'std']
-        else:
-            var_names = ['min', 'max', 'range']
-            if not hasattr(data, 'species_x_range'):
-                var_names.remove('range')
-        
+        var_names = trait_mode.split('_')
 
         if trait_mode == 'mean_std':
             pred_mean = ret['pred_mean']

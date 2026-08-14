@@ -1,14 +1,11 @@
 **/secrets.toml
 **/__pycache__/*
 .vscode/
-accept*json
-legacy/*
 data/Ferns
 *pth
 *png
 attributions_*csv
-australian_imgs/
 data/
-guido
 wandb
 results
+uv.lock
