@@ -1,0 +1,22 @@
+name: r-baselines
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+  - r-base=4.5.3
+
+  # Baseline R
+  - r-mice
+  - r-rpart
+  - r-missforest
+  - r-rphylopars=0.3.10
+  - r-ape
+
+  # Runtime GNU
+  - libgcc-ng
+  - libstdcxx-ng>=12
+
+variables:
+  RPY2_CFFI_MODE: "ABI"

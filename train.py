@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from loader import PlantDataset, NormalizeFeatures, data_split
 from models import TraitsPredictor, DeterministicLoss, MixedNLLLoss, MultiTargetDeterministicLoss, graph_smoothness_loss
-from baselines_training import compute_correlation
+from soft_delete.baselines_training import compute_correlation
 from tester import Tester, fit_conformal_residual_bounds, fit_conformal_residual_bounds_minmax
 from tqdm import trange
 from pathlib import Path
@@ -47,10 +47,6 @@ def resolve_checkpoint_path(load_checkpoint: str | Path | None, output_dir: Path
 torch.set_float32_matmul_precision('medium')
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-seed = 42
-pl.seed_everything(seed)
-torch.cuda.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
 
 
 def create_validation_mask(observed_mask: torch.Tensor, ratio: float, seed_value: int) -> torch.Tensor:
@@ -85,6 +81,7 @@ def get_args():
     parser.add_argument('-e', '--epochs', type=int, default=1000, help='Number of epochs to train the model')
     parser.add_argument('--use_env_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use environmental features')
     parser.add_argument('--use_phylo_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use phylogenetic features')
+    parser.add_argument('--shuffle_phylo', type=str2bool, nargs='?', const=True, default=False, help='Whether to shuffle phylogenetic features (for ablation studies)')
     parser.add_argument('--output_dir', type=Path, default='results/', help='Directory to save results and models')
     parser.add_argument('--trait_representation', type=str, default='min_max_range', choices=['mean_std', 'min_max_range'], help='Trait representation to use (mean/std or min/max/range)')
     parser.add_argument('--keep_range_features', type=str2bool, nargs='?', const=True, default=False, help='Whether to keep range features in the dataset (only relevant for min_max_range representation)')
@@ -98,6 +95,7 @@ def get_args():
     parser.add_argument('--per_trait_loss', type=str2bool, nargs='?', const=True, default=True, help='Use per-trait loss reduction instead of flat entry-wise averaging')
     parser.add_argument('--k', type=int, default=-1, help='Fold index for cross-validation (0-4). Use -1 to perform a complete run over all folds sequentially.')
     parser.add_argument('--split_strategy', type=str, default='random', choices=['random', 'louvain'], help='Outer CV split: random is transductive; louvain requires balanced graph communities')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed used for splitting and training')
 
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for the optimizer')
     parser.add_argument('--gnn_module', type=str, default='GATv2Conv', help="GNN attention module")#, choices=['GATConv', 'GATv2Conv', 'TransformerConv'])
@@ -160,19 +158,25 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
     trait_names = dataset.trait_names
     raw_data = cast(Data, dataset[0])
 
+    if args.shuffle_phylo:
+        print("Shuffling phylogenetic features for ablation study...")
+        species_indices = torch.randperm(raw_data.species_x_phylo.size(0), generator=torch.Generator().manual_seed(args.seed))
+        raw_data.species_x_phylo = raw_data.species_x_phylo[species_indices]
+        # Remap species edges (species_species_edge_index and species_species_edge_attr) to match the shuffled order
+        species_mapping = torch.zeros(raw_data.species_x_phylo.size(0), dtype=torch.long, device=raw_data.species_species_edge_index.device)
+        species_mapping[species_indices] = torch.arange(raw_data.species_x_phylo.size(0), device=raw_data.species_x_phylo.device)
+        raw_data.species_species_edge_index = species_mapping[raw_data.species_species_edge_index]
+
     # Fit preprocessing on outer-training species only; transform the complete
     # graph afterward so evaluation uses the same fold-specific scale.
     raw_train_data, _ = data_split(raw_data, k=args.k, seed=seed, split_strategy=args.split_strategy)
-    raw_train_data = cast(Data, raw_train_data)
     norm_transform.fit(raw_train_data)
     data = norm_transform(raw_data.clone())
             
-    trait_feature_keys = ['species_x_mean', 'species_x_std']
-    if args.trait_representation == 'min_max_range':
-        trait_feature_keys = ['species_x_min', 'species_x_max', 'species_x_range']
-        if not args.keep_range_features:
-            trait_feature_keys.remove('species_x_range')
-            data.pop('species_x_range')
+    trait_feature_keys = [f'species_x_{k}' for k in args.trait_representation.split('_')]
+    if not args.keep_range_features:
+        trait_feature_keys.remove('species_x_range')
+        data.pop('species_x_range')
 
     model = TraitsPredictor(in_traits=len(trait_names), in_gen=data.species_x_gen.size(1), in_phylo=data.species_x_phylo.size(1),  # type: ignore
                             in_space=data.spatial_global_data.size(1), out_channels=len(trait_names),  # type: ignore
@@ -394,14 +398,16 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
         )
 
     # --- Full evaluation pipeline (Part 1 + Part 2) ---
-    gen_col_names = list(dataset.traits_gen.columns)
+    gen_col_names = getattr(data, 'genetic_feature_names', None)
     environment_feature_names = getattr(data, 'spatial_global_feature_names', None)
     env_col_names = None
     if environment_feature_names is not None and len(environment_feature_names) == data.spatial_global_data.size(1):
         env_col_names = [f"pos_{index}" for index in range(data.spatial_x.size(1))] + list(environment_feature_names)
     print("Launching full evaluation pipeline...")
     model.eval()
-    tester.test_routine(model, data, norm_transform, trait_names, device,
+
+    # TODO: check: perché qua (ne mai) uso il test set? 
+    tester.test_routine(model, data, norm_transform, trait_names,
                         save_dir=args.output_dir / f'fold_{args.k}',
                         compute_xai=args.compute_xai,
                         gen_col_names=gen_col_names,
@@ -416,6 +422,10 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
 
 if __name__ == "__main__":
     args = get_args()
+    seed = args.seed
+    pl.seed_everything(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     exp_name = "fern_"
     if args.use_env_features:
         exp_name += "env_"
@@ -430,7 +440,6 @@ if __name__ == "__main__":
             f"_min{args.trait_norm_min}_max{args.trait_norm_max}"
             f"_range{args.trait_norm_range}"
         )
-    exp_name += f"_split{args.split_strategy}"
     if args.trait_representation == 'min_max_range':
         exp_name += f"_bounds{args.invalid_bounds_policy}"
     exp_name += "_ptr" if args.per_trait_loss else "_flat"

@@ -1,0 +1,11 @@
+# Configuration
+
+Creazione R Environment
+
+micromamba create -f environment.yml -y
+
+Create python environment using uv
+uv sync --frozen
+
+To run the baselines:
+run_baselines.sh

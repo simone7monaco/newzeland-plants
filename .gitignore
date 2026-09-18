@@ -7,5 +7,6 @@ data/Ferns
 attributions_*csv
 data/
 wandb
-results
+*results/
 uv.lock
+soft_delete

@@ -536,8 +536,11 @@ def _species_ig(model, data, test_indices, trait_names, device,
         d = Batch.from_data_list(datas)
         out = model(d)
         if isinstance(out, tuple) and len(out) == 2:
-            pm = out[0]
-            outputs = pm  # shape (total_nodes, n_traits)
+            if trait_mode == 'mean_std':
+                outputs = out[0]
+            else:
+                pmin, pmax = out
+                outputs = torch.cat([pmin, pmax], dim=1)
         elif isinstance(out, tuple) and len(out) == 3:
             pmin, pmax, pr = out
             # stack variables in order: [min_0..min_N-1, max_0.., range_0..]
@@ -727,8 +730,11 @@ def _spatial_ig(model, data, test_indices, trait_names,
         d = Batch.from_data_list(datas)
         out = model(d)
         if isinstance(out, tuple) and len(out) == 2:
-            pm = out[0]
-            outputs = pm
+            if trait_mode == 'mean_std':
+                outputs = out[0]
+            else:
+                pmin, pmax = out
+                outputs = torch.cat([pmin, pmax], dim=1)
         elif isinstance(out, tuple) and len(out) == 3:
             pmin, pmax, pr = out
             outputs = torch.cat([pmin, pmax, pr], dim=1)
@@ -1206,7 +1212,7 @@ class Tester:
         self._orig_range_dfs: list[pd.DataFrame] = []
 
     @torch.no_grad()
-    def test_routine(self, model, data, norm_transform, trait_names, device,
+    def test_routine(self, model, data, norm_transform, trait_names,
                     save_dir="results", compute_xai=True, n_ig_steps=50,
                     ig_internal_batch_size=None,
                     gen_col_names=None, env_col_names=None,
@@ -1222,7 +1228,6 @@ class Tester:
         data           : full (unsplit) normalised HeteroData with .test_mask
         norm_transform : NormalizeFeatures  (for inverse normalisation)
         trait_names    : list[str]  trait column names
-        device         : torch.device
         save_dir       : str / Path  for all outputs
         compute_xai    : bool  whether to run IG  (Part 2, can be slow)
         n_ig_steps     : int   interpolation steps for Captum IG
@@ -1238,8 +1243,8 @@ class Tester:
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        model.to(device).eval()
-        data = data.to(device)
+        model.to(self.device).eval()
+        data = data.to(self.device)
         test_indices = torch.where(data.test_mask)[0]
         species_names = [data.species_names[i] for i in test_indices.cpu().numpy()]
 
@@ -1247,7 +1252,7 @@ class Tester:
 
         # == Part 1: Leave-one-trait-out ==============================
         print("\n====== Part 1: Leave-one-trait-out evaluation ======")
-        ret = leave_one_trait_out(model, data, test_indices, device)
+        ret = leave_one_trait_out(model, data, test_indices, self.device)
         trait_mode = ret['mode']
         self.trait_mode = trait_mode
         var_names = trait_mode.split('_')
@@ -1319,7 +1324,7 @@ class Tester:
             pd.DataFrame(pred_min.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_min.csv")
             pd.DataFrame(pred_max.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_max.csv")
 
-            if 'range' in var_names:
+            if pred_range is not None:
                 pd.DataFrame(pred_range.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_range.csv")
 
             # -- original-space metrics --
@@ -1447,7 +1452,7 @@ class Tester:
 
             # --- species-side ---
             sp_attr = _species_ig(
-                model, data, test_indices, trait_names, device,
+                model, data, test_indices, trait_names, self.device,
                 n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size, gen_col_names=gen_col_names,
                 var_names=var_names
             )
@@ -1470,7 +1475,7 @@ class Tester:
                     )
                 sa_attr = _spatial_ig(
                     model, data, test_indices, trait_names,
-                    env_col_names, device, n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size,
+                    env_col_names, self.device, n_steps=n_ig_steps, internal_batch_size=ig_internal_batch_size,
                     var_names=var_names
                 )
                 sa_attr.to_csv(save_dir / "attributions_spatial.csv", index=False)

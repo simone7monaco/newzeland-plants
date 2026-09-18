@@ -1,4 +1,5 @@
 import sys
+from typing import cast
 import warnings
 import numpy as np
 import xarray as xr
@@ -27,7 +28,7 @@ from torch_geometric.data import Data, HeteroData, InMemoryDataset
 from torch_geometric.utils import from_networkx, subgraph, bipartite_subgraph
 
 FEATURE_CACHE_VERSION = 2
-PROCESSED_DATA_VERSION = 4
+PROCESSED_DATA_VERSION = 5
 
 
 def _yj_transform(x: np.ndarray, lmbda: float) -> np.ndarray:
@@ -280,7 +281,16 @@ class PlantDataset(InMemoryDataset):
     
     @staticmethod
     def load_raster(f, grid_step=.1, max_window_pixels=1_000_000):
-        raster = xr.open_dataarray(f, engine="rasterio")
+        if f.exists():
+            raster = xr.open_dataarray(f, engine="rasterio")
+        else:
+            # search for subspecies to merge
+            raster_list = [xr.open_dataarray(subsp_f, engine="rasterio") for subsp_f in f.parent.glob(f"{f.stem.split('_distribution')[0]}*{f.suffix}")]
+            if not raster_list:
+                raise FileNotFoundError(f"No distribution raster or matching subspecies rasters found for {f}")
+            aligned_rasters = xr.align(*raster_list, join="outer", fill_value=0)
+            raster = xr.concat(aligned_rasters, dim="subspecies").sum("subspecies", skipna=True)
+
         current_step = abs(float((raster.x[1] - raster.x[0]).values))  # degrees
         downsample = max(1, round(grid_step / current_step))
 
@@ -367,7 +377,6 @@ class PlantDataset(InMemoryDataset):
             trait_columns[trait_name][statistic] = column
 
         categorical_columns = list(dict.fromkeys(categorical_columns))
-        gen_cols = categorical_columns
         self.traits_gen = trait_values[categorical_columns]
         if trait_representation == 'mean_std':
             selected_traits = {
@@ -451,19 +460,28 @@ class PlantDataset(InMemoryDataset):
         for df in [getattr(self, attr) for attr in ['traits_mean', 'traits_std', 'traits_min', 'traits_max', 'traits_range'] if hasattr(self, attr)]:
             df.drop(columns=df.columns[(df.isna().sum() / len(df)) > drop_threshold], inplace=True)
 
-        for cl_feat in gen_cols:
+        if self.trait_representation == 'min_max_range':
+            incomplete_bounds = (
+                self.traits_min.isna()
+                | self.traits_max.isna()
+                | self.traits_range.isna()
+            )
+            for frame in (self.traits_min, self.traits_max, self.traits_range):
+                frame.mask(incomplete_bounds, inplace=True)
+
+        for cl_feat in categorical_columns:
             for cl in self.traits_gen[cl_feat].unique(): # type: ignore
                 if self.traits_gen[cl_feat].eq(cl).sum() < len(self.traits_gen) * dummy_threshold and not pd.isna(cl):
                     self.traits_gen[cl_feat] = self.traits_gen[cl_feat].replace({cl: 'Other'})
-        self.traits_gen = pd.get_dummies(self.traits_gen, drop_first=True)
+        self.traits_gen_dummy = pd.get_dummies(self.traits_gen, drop_first=True)
 
         if self.trait_representation == 'mean_std':
             for col in self.traits_mean.columns.difference(self.traits_std.columns):
                 self.traits_std[col] = np.nan
             self.traits_std = self.traits_std[self.traits_mean.columns]
-            return (self.traits_mean, self.traits_std), self.traits_gen
+            return (self.traits_mean, self.traits_std), self.traits_gen_dummy
         else:
-            return (self.traits_min, self.traits_max, self.traits_range), self.traits_gen
+            return (self.traits_min, self.traits_max, self.traits_range), self.traits_gen_dummy
 
     @property
     def raw_dir(self):
@@ -508,7 +526,6 @@ class PlantDataset(InMemoryDataset):
                 band_raster = interpolated_raster.sel(band=band).to_pandas().reset_index().melt(id_vars=['y'])
                 feat_name = f.stem if band == 0 else f"{f.stem}_{band}"
                 band_raster = band_raster.rename(columns={'value': feat_name})
-                # TODO: va bene la media per tutte le variabili?
                 comp_rasters.append(self.space_df.set_index(['x', 'y']).join(band_raster.set_index(['x', 'y'])).groupby(['cluster']).mean()[feat_name])
                 if f.stem == 'NZ population density layer':
                     comp_rasters[-1] = np.log1p(comp_rasters[-1])
@@ -578,7 +595,8 @@ class PlantDataset(InMemoryDataset):
         setattr(self.species_graph, self.pivot_feature, torch.tensor(getattr(self, self.pivot_feature).fillna(0).astype(np.float32).values))
         
         self.traits_gen = self.traits_gen.loc[self.species_graph.node_names]
-        self.species_graph.x_gen = torch.tensor(self.traits_gen.astype(np.float32).values)
+        self.traits_gen_dummy = self.traits_gen_dummy.loc[self.species_graph.node_names]
+        self.species_graph.x_gen = torch.tensor(self.traits_gen_dummy.astype(np.float32).values)
 
         return self.species_graph
 
@@ -656,6 +674,7 @@ class PlantDataset(InMemoryDataset):
                 species_x_std=species_graph.traits_std,
         )
         data_all.species_x_gen = species_graph.x_gen
+        data_all.genetic_feature_names = self.traits_gen_dummy.columns.astype(str).tolist()
         data_all.species_names = species_graph.node_names
         data_all.species_x_phylo = species_graph.x
         data_all.traits_nanmask = species_graph.traits_nanmask
@@ -733,6 +752,8 @@ def data_split(data, test_size=0.3, k=0, seed=42, split_strategy='random'):
         test_data[f'species_{attr}'] = test_data[f'species_{attr}'][test_mask]
     train_data.traits_nanmask = train_data.traits_nanmask[train_mask]
     test_data.traits_nanmask = test_data.traits_nanmask[test_mask]
+    train_data.species_names = [name for name, mask in zip(data.species_names, train_mask) if mask]
+    test_data.species_names = [name for name, mask in zip(data.species_names, test_mask) if mask]
     train_data.species_num_nodes = train_mask.sum().item()
     test_data.species_num_nodes = test_mask.sum().item()
     train_data.num_nodes = train_data.species_num_nodes + train_data.spatial_num_nodes
@@ -749,6 +770,8 @@ def data_split(data, test_size=0.3, k=0, seed=42, split_strategy='random'):
             (torch.ones(data.spatial_num_nodes, dtype=torch.bool), mask), 
             edge_index=data.spatial_species_edge_index, edge_attr=data.spatial_species_edge_attr, relabel_nodes=True
             )
+    train_data = cast(Data, train_data)
+    test_data = cast(Data, test_data)
     return train_data, test_data
 
 if __name__ == '__main__':
