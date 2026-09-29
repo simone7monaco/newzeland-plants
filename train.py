@@ -532,7 +532,19 @@ if __name__ == "__main__":
                 prediction_file_types += ['attributions_spatial']
 
         for file_type in prediction_file_types:
-            df_cat = pd.concat([pd.read_csv(subdir / f"{file_type}.csv") for subdir in args.output_dir.glob('fold_*')], ignore_index=True)
-            df_cat.to_csv(args.output_dir / f"{file_type}_all.csv", index=False)
-            print(f"Saved concatenated {file_type} to {args.output_dir / f'{file_type}_all.csv'}")
+            # Prefer Parquet; fall back to CSV if present for backward compatibility
+            parts: list[pd.DataFrame] = []
+            for subdir in args.output_dir.glob('fold_*'):
+                parquet_path = subdir / f"{file_type}.parquet"
+                csv_path = subdir / f"{file_type}.csv"
+                if parquet_path.exists():
+                    parts.append(pd.read_parquet(parquet_path))
+                elif csv_path.exists():
+                    parts.append(pd.read_csv(csv_path))
+            if not parts:
+                continue
+            df_cat = pd.concat(parts, ignore_index=True)
+            out_path = args.output_dir / f"{file_type}_all.parquet"
+            df_cat.to_parquet(out_path, index=False)
+            print(f"Saved concatenated {file_type} to {out_path}")
         tester.sanity_checks()

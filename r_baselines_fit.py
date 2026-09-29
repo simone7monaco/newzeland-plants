@@ -432,12 +432,31 @@ if __name__ == "__main__":
             model_dir = args.output_dir / f"{model_name.upper()}{args.model_dir_suffix}"
             fold_dirs = sorted(model_dir.glob('fold_*'))
 
-            metrics_all = pd.concat([pd.read_csv(d / 'per_trait_metrics.csv') for d in fold_dirs], ignore_index=True)
-            metrics_all.to_csv(model_dir / 'per_trait_metrics_all.csv', index=False)
+            parts: list[pd.DataFrame] = []
+            for d in fold_dirs:
+                p = d / 'per_trait_metrics.parquet'
+                c = d / 'per_trait_metrics.csv'
+                if p.exists():
+                    parts.append(pd.read_parquet(p))
+                elif c.exists():
+                    parts.append(pd.read_csv(c))
+            if parts:
+                metrics_all = pd.concat(parts, ignore_index=True)
+                metrics_all.to_parquet(model_dir / 'per_trait_metrics_all.parquet', index=False)
 
             for variable in variable_names:
-                preds_all = pd.concat([pd.read_csv(d / f'predictions_{variable}.csv', index_col=0) for d in fold_dirs])
+                pred_parts: list[pd.DataFrame] = []
+                for d in fold_dirs:
+                    p = d / f'predictions_{variable}.parquet'
+                    c = d / f'predictions_{variable}.csv'
+                    if p.exists():
+                        pred_parts.append(pd.read_parquet(p))
+                    elif c.exists():
+                        pred_parts.append(pd.read_csv(c, index_col=0))
+                if not pred_parts:
+                    continue
+                preds_all = pd.concat(pred_parts)
                 preds_all.index.name = 'species'
-                preds_all.to_csv(model_dir / f'predictions_{variable}_all.csv')
+                preds_all.to_parquet(model_dir / f'predictions_{variable}_all.parquet')
 
             print(f"Saved merged results for '{model_name}' to {model_dir}/")

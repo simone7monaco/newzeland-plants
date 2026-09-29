@@ -21,7 +21,7 @@ FEATURE_COMBINATIONS = (
     (False, False, "no_env_no_phylo"),
 )
 COMBINATION_MAP = {name: (use_env, use_phylo) for use_env, use_phylo, name in FEATURE_COMBINATIONS}
-ATTRIBUTION_FILES = ("attributions_species_all.csv", "attributions_spatial_all.csv")
+ATTRIBUTION_FILES = ("attributions_species_all.parquet", "attributions_spatial_all.parquet")
 DETERMINISTIC_BASELINES = (
     "training_mean",
     "training_median",
@@ -52,8 +52,8 @@ def parse_args() -> argparse.Namespace:
         help="Benchmark run and aggregate output directory",
     )
     parser.add_argument(
-        "--result-file", default="predictions_max_all.csv",
-        help="Per-model merged CSV to aggregate (default: predictions_max_all.csv)",
+        "--result-file", default="predictions_max_all.parquet",
+        help="Per-model merged file to aggregate (default: predictions_max_all.parquet)",
     )
     parser.add_argument(
         "--gnn-args", default="",
@@ -103,7 +103,11 @@ def read_csv(
     use_env_features: bool | None = None,
     use_phylo_features: bool | None = None,
 ) -> pd.DataFrame:
-    frame = pd.read_csv(path)
+    # Support both Parquet and CSV for backward compatibility
+    if path.suffix.lower() in (".parquet", ".pq"):
+        frame = pd.read_parquet(path)
+    else:
+        frame = pd.read_csv(path)
     unnamed_columns = [column for column in frame.columns if column.startswith("Unnamed:")]
     if "species" not in frame.columns and unnamed_columns:
         frame = frame.rename(columns={unnamed_columns[0]: "species"})
@@ -241,7 +245,7 @@ def main() -> None:
 
                 for filename in ATTRIBUTION_FILES:
                     attribution_path = artifact_dir / filename
-                    if filename == "attributions_spatial_all.csv" and not use_env:
+                    if filename == "attributions_spatial_all.parquet" and not use_env:
                         continue
                     if not attribution_path.is_file():
                         raise FileNotFoundError(f"GNN attribution file was not produced: {attribution_path}")
@@ -258,7 +262,7 @@ def main() -> None:
     LOGGER.info("All training jobs completed; aggregating CSV files")
 
     # Result files to collect: include both min and max by default plus any explicit result-file
-    default_result_files = ["predictions_min_all.csv", "predictions_max_all.csv"]
+    default_result_files = ["predictions_min_all.parquet", "predictions_max_all.parquet"]
     result_files = list(dict.fromkeys([args.result_file] + default_result_files))
 
     # Prepare aggregation containers per result file and combination
@@ -330,7 +334,7 @@ def main() -> None:
 
                 for attr_filename in ATTRIBUTION_FILES:
                     attribution_path = artifact_dir / attr_filename
-                    if attr_filename == "attributions_spatial_all.csv" and not use_env:
+                    if attr_filename == "attributions_spatial_all.parquet" and not use_env:
                         continue
                     if attribution_path.is_file():
                         aggregated_attributions[combination_name][attr_filename].append(read_csv(
@@ -351,7 +355,8 @@ def main() -> None:
             if frames:
                 combined_predictions = pd.concat(frames, ignore_index=True, sort=False)
                 prediction_path = combination_dir / filename
-                combined_predictions.to_csv(prediction_path, index=False)
+                # Write aggregated predictions as Parquet
+                combined_predictions.to_parquet(prediction_path, index=False)
                 LOGGER.info("Saved %d rows to %s", len(combined_predictions), prediction_path)
             else:
                 LOGGER.info("No prediction frames found for %s %s; skipping write", combination_name, filename)
@@ -361,7 +366,7 @@ def main() -> None:
                 continue
             combined_attributions = pd.concat(frames, ignore_index=True, sort=False)
             attribution_path = combination_dir / filename
-            combined_attributions.to_csv(attribution_path, index=False)
+            combined_attributions.to_parquet(attribution_path, index=False)
             LOGGER.info("Saved %d rows to %s", len(combined_attributions), attribution_path)
     LOGGER.info("Benchmark completed successfully")
 

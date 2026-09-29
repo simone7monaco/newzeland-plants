@@ -341,7 +341,7 @@ class MultiTargetDeterministicLoss(nn.Module):
         
         if len(predictions) == 3:
             huber_keys = ('huber_min', 'huber_max', 'huber_range')
-        elif len(predictions) == 2: # TODO: permettere parametrizzazione midpoint + log-range
+        elif len(predictions) == 2:
             huber_keys = ('huber_min', 'huber_max')
         else:
             raise ValueError('min_max_range loss requires min, max, (and range) predictions and targets. Got inconsistent number of elements')

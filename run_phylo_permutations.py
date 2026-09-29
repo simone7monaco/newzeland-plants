@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 LOGGER = logging.getLogger("phylo_permutations")
 
-ATTRIBUTION_FILES = ("attributions_species_all.csv", "attributions_spatial_all.csv")
+ATTRIBUTION_FILES = ("attributions_species_all.parquet", "attributions_spatial_all.parquet")
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -40,8 +40,8 @@ def parse_args() -> argparse.Namespace:
         help="Base output directory to store permutation runs and aggregates",
     )
     parser.add_argument(
-        "--result-file", default="predictions_max_all.csv",
-        help="Per-run merged CSV filename to expect and aggregate (default: predictions_max_all.csv)",
+        "--result-file", default="predictions_max_all.parquet",
+        help="Per-run merged Parquet filename to expect and aggregate (default: predictions_max_all.parquet)",
     )
     parser.add_argument(
         "--gnn-args", default="",
@@ -82,7 +82,11 @@ def run(command: list[str], *, label: str) -> None:
 
 
 def read_csv(path: Path, *, seed: int, model: str, source: str, use_env_features: bool | None = None, use_phylo_features: bool | None = None,) -> pd.DataFrame:
-    frame = pd.read_csv(path)
+    # Support Parquet and CSV for backward compatibility
+    if path.suffix.lower() in (".parquet", ".pq"):
+        frame = pd.read_parquet(path)
+    else:
+        frame = pd.read_csv(path)
     unnamed_columns = [column for column in frame.columns if column.startswith("Unnamed:")]
     if "species" not in frame.columns and unnamed_columns:
         frame = frame.rename(columns={unnamed_columns[0]: "species"})
@@ -143,7 +147,7 @@ def main() -> None:
     LOGGER.info("All permutation runs finished; aggregating outputs")
 
     # Aggregate both min and max prediction files (plus any explicit --result-file)
-    default_result_files = ["predictions_min_all.csv", "predictions_max_all.csv"]
+    default_result_files = ["predictions_min_all.parquet", "predictions_max_all.parquet"]
     result_files = list(dict.fromkeys([args.result_file] + default_result_files))
 
     aggregated_frames: dict[str, list[pd.DataFrame]] = {filename: [] for filename in result_files}
@@ -185,7 +189,7 @@ def main() -> None:
     for filename, frames in aggregated_frames.items():
         if frames:
             combined = pd.concat(frames, ignore_index=True, sort=False)
-            combined.to_csv(perm_out_dir / filename, index=False)
+            combined.to_parquet(perm_out_dir / filename, index=False)
             LOGGER.info("Saved %d rows to %s", len(combined), perm_out_dir / filename)
         else:
             LOGGER.info("No prediction frames to aggregate for %s", filename)
@@ -194,7 +198,7 @@ def main() -> None:
         if not frames:
             continue
         combined = pd.concat(frames, ignore_index=True, sort=False)
-        combined.to_csv(perm_out_dir / filename, index=False)
+        combined.to_parquet(perm_out_dir / filename, index=False)
         LOGGER.info("Saved %d rows to %s", len(combined), perm_out_dir / filename)
 
     LOGGER.info("Permutation benchmark completed")

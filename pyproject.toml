@@ -33,6 +33,8 @@ dependencies = [
     "rpy2>=3.6,<3.7",
     "ipykernel>=7.3.0",
     "jupyter>=1.1.1",
+    "ipywidgets>=8.1.9",
+    "ipython>=9.17.1",
 ]
 
 [tool.uv.sources]

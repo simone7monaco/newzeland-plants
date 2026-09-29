@@ -305,6 +305,12 @@ def load_metric_rows(results_dir: Path, traits_file: Path) -> pd.DataFrame:
     metrics["display_model"] = metrics["model"].map(model_display_name)
     scales = trait_scales(traits_file)
     metrics = metrics.merge(scales, on=["trait", "variable"], how="left")
+    for metric, source_column in (("NRMSE_IQR", "RMSE"), ("NMAE_IQR", "MAE")):
+        denominator = metrics["trait_iqr"].where(metrics["trait_iqr"] > 0)
+        metrics[metric] = metrics[source_column] / denominator
+    for metric, source_column in (("NRMSE_range", "RMSE"), ("NMAE_range", "MAE")):
+        denominator = metrics["trait_range"].where(metrics["trait_range"] > 0)
+        metrics[metric] = metrics[source_column] / denominator
     gnn_param_counts = discover_gnn_parameter_counts(results_dir)
     estimated_k_parameters = [
         gnn_param_counts.get(configuration_id, float("nan"))
@@ -459,10 +465,14 @@ def discover_benchmark_attribution_rows(results_dir: Path, kind: str) -> pd.Data
     runs_dir = results_dir / "runs"
     records: list[pd.DataFrame] = []
     for combination_name in BENCHMARK_CONFIG_MAP:
-        merged_file = results_dir / combination_name / f"attributions_{kind}_all.csv"
+        merged_file = results_dir / combination_name / f"attributions_{kind}_all.parquet"
         if not merged_file.exists():
             continue
-        frame = pd.read_csv(merged_file)
+        # Support Parquet and legacy CSV
+        if merged_file.suffix.lower() in (".parquet", ".pq"):
+            frame = pd.read_parquet(merged_file)
+        else:
+            frame = pd.read_csv(merged_file)
         if not {"species", "target_trait", "variable"}.issubset(frame.columns):
             continue
         frame = frame.copy()
@@ -479,14 +489,18 @@ def discover_benchmark_attribution_rows(results_dir: Path, kind: str) -> pd.Data
 def discover_legacy_attribution_rows(results_dir: Path, kind: str) -> pd.DataFrame:
     records: list[pd.DataFrame] = []
     for experiment_dir in sorted(path for path in results_dir.iterdir() if path.is_dir()):
-        merged_file = experiment_dir / f"attributions_{kind}_all.csv"
+        merged_file = experiment_dir / f"attributions_{kind}_all.parquet"
         attribution_files = [merged_file] if merged_file.exists() else sorted(experiment_dir.glob(f"fold_*/attributions_{kind}.csv"))
         if not attribution_files:
             continue
         metadata = configuration_metadata(experiment_dir.name)
         protocol = _detect_attribution_protocol(sorted(experiment_dir.glob("fold_*/attributions_metadata.json")))
         for attribution_file in attribution_files:
-            frame = pd.read_csv(attribution_file)
+            # Support Parquet and legacy CSV
+            if attribution_file.suffix.lower() in (".parquet", ".pq"):
+                frame = pd.read_parquet(attribution_file)
+            else:
+                frame = pd.read_csv(attribution_file)
             if not {"species", "target_trait", "variable"}.issubset(frame.columns):
                 continue
             frame = frame.copy()
