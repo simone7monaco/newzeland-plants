@@ -30,6 +30,7 @@ DETERMINISTIC_BASELINES = (
     "rphylopars_bm",
 )
 STOCHASTIC_BASELINES = ("mice",)
+BASELINES = DETERMINISTIC_BASELINES + STOCHASTIC_BASELINES
 LOGGER = logging.getLogger("benchmark")
 
 
@@ -121,6 +122,30 @@ def read_csv(
     return frame
 
 
+def find_baseline_results(
+    baseline_dir: Path,
+    models: tuple[str, ...],
+    filename: str,
+) -> dict[str, Path]:
+    """Return the result for each requested model that has completed in this seed."""
+    results: dict[str, Path] = {}
+    for model in models:
+        model_prefix = f"{model.upper()}_"
+        matches = sorted(
+            path
+            for path in baseline_dir.glob(f"*/{filename}")
+            if path.parent.name == model.upper() or path.parent.name.startswith(model_prefix)
+        )
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Found multiple {filename} files for baseline '{model}' below {baseline_dir}: "
+                f"{matches}"
+            )
+        if matches:
+            results[model] = matches[0]
+    return results
+
+
 def main() -> None:
     args = parse_args()
     configure_logging(args.log_level)
@@ -132,78 +157,39 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     gnn_args = shlex.split(args.gnn_args)
     baseline_args = shlex.split(args.baseline_args)
-    predictions = {name: [] for _, _, name in FEATURE_COMBINATIONS}
-    attributions = {
-        name: {filename: [] for filename in ATTRIBUTION_FILES}
-        for _, _, name in FEATURE_COMBINATIONS
-    }
-
     seeds = range(args.start_seed, args.start_seed + args.n_seeds)
-    deterministic_dir = runs_dir / "deterministic_baselines"
-    deterministic_seed = args.start_seed
-    deterministic_results = sorted(deterministic_dir.glob(f"*/{args.result_file}"))
-    if len(deterministic_results) == len(DETERMINISTIC_BASELINES):
-        LOGGER.info("Found existing deterministic baseline results in %s; skipping run", deterministic_dir)
-    else:
-        run([
-            "bash", "run_baselines.sh", *baseline_args,
-            "--baseline_models", ",".join(DETERMINISTIC_BASELINES),
-            "--k", "-1", "--seed", str(deterministic_seed),
-            "--output_dir", str(deterministic_dir),
-        ], label=f"Deterministic baselines (split seed {deterministic_seed})")
-        deterministic_results = sorted(deterministic_dir.glob(f"*/{args.result_file}"))
-        if len(deterministic_results) != len(DETERMINISTIC_BASELINES):
-            raise FileNotFoundError(
-                f"Expected {len(DETERMINISTIC_BASELINES)} deterministic baseline results "
-                f"below {deterministic_dir}, found {len(deterministic_results)}"
-            )
-    deterministic_frames = [
-        read_csv(
-            result,
-            seed=deterministic_seed,
-            model=result.parent.name,
-            source="deterministic_baseline",
-        )
-        for result in deterministic_results
-    ]
-    for use_env, use_phylo, combination_name in FEATURE_COMBINATIONS:
-        for baseline_frame in deterministic_frames:
-            frame = baseline_frame.copy()
-            frame.insert(1, "use_env_features", use_env)
-            frame.insert(2, "use_phylo_features", use_phylo)
-            predictions[combination_name].append(frame)
-
-    total_jobs = 1 + args.n_seeds * (1 + len(FEATURE_COMBINATIONS))
+    total_jobs = args.n_seeds * (1 + len(FEATURE_COMBINATIONS))
     LOGGER.info(
         "Benchmark started: %d seeds, %d jobs, output=%s",
         args.n_seeds, total_jobs, output_dir,
     )
 
-    with tqdm(total=total_jobs, initial=1, desc="Benchmark", unit="job", dynamic_ncols=True) as progress:
+    with tqdm(total=total_jobs, desc="Benchmark", unit="job", dynamic_ncols=True) as progress:
         for seed in seeds:
             seed_dir = runs_dir / f"seed_{seed}"
             baseline_dir = seed_dir / "baselines"
-            progress.set_postfix_str(f"seed={seed} stochastic baselines", refresh=True)
-            baseline_results = sorted(baseline_dir.glob(f"*/{args.result_file}"))
-            if len(baseline_results) == len(STOCHASTIC_BASELINES):
-                LOGGER.info("Found existing stochastic baseline results for seed %d; skipping", seed)
-            else:
+            progress.set_postfix_str(f"seed={seed} baselines", refresh=True)
+            baseline_results = find_baseline_results(baseline_dir, BASELINES, args.result_file)
+            missing_baselines = tuple(model for model in BASELINES if model not in baseline_results)
+            if missing_baselines:
+                completed = tuple(model for model in BASELINES if model in baseline_results)
+                if completed:
+                    LOGGER.info("Seed %d already has baselines %s; skipping them", seed, ", ".join(completed))
                 run([
                     "bash", "run_baselines.sh", *baseline_args,
-                    "--baseline_models", ",".join(STOCHASTIC_BASELINES),
+                    "--baseline_models", ",".join(missing_baselines),
                     "--k", "-1", "--seed", str(seed),
                     "--output_dir", str(baseline_dir),
-                ], label=f"Stochastic baselines (seed {seed})")
-                baseline_results = sorted(baseline_dir.glob(f"*/{args.result_file}"))
-                if len(baseline_results) != len(STOCHASTIC_BASELINES):
+                ], label=f"Missing baselines {', '.join(missing_baselines)} (seed {seed})")
+                baseline_results = find_baseline_results(baseline_dir, BASELINES, args.result_file)
+                still_missing = tuple(model for model in BASELINES if model not in baseline_results)
+                if still_missing:
                     raise FileNotFoundError(
-                        f"Expected {len(STOCHASTIC_BASELINES)} stochastic baseline results "
-                        f"below {baseline_dir}, found {len(baseline_results)}"
+                        f"Baseline results were not produced for {', '.join(still_missing)} "
+                        f"below {baseline_dir}"
                     )
-            baseline_frames = [
-                read_csv(result, seed=seed, model=result.parent.name, source="r_baseline")
-                for result in baseline_results
-            ]
+            else:
+                LOGGER.info("Found all baseline results for seed %d; skipping", seed)
             progress.update()
 
             for use_env, use_phylo, combination_name in FEATURE_COMBINATIONS:
@@ -229,34 +215,12 @@ def main() -> None:
                         )
                 gnn_result = gnn_results[0]
                 artifact_dir = gnn_result.parent
-                predictions[combination_name].append(read_csv(
-                    gnn_result,
-                    seed=seed,
-                    model="gnn",
-                    source="gnn",
-                    use_env_features=use_env,
-                    use_phylo_features=use_phylo,
-                ))
-                for baseline_frame in baseline_frames:
-                    frame = baseline_frame.copy()
-                    frame.insert(1, "use_env_features", use_env)
-                    frame.insert(2, "use_phylo_features", use_phylo)
-                    predictions[combination_name].append(frame)
-
                 for filename in ATTRIBUTION_FILES:
                     attribution_path = artifact_dir / filename
                     if filename == "attributions_spatial_all.parquet" and not use_env:
                         continue
                     if not attribution_path.is_file():
                         raise FileNotFoundError(f"GNN attribution file was not produced: {attribution_path}")
-                    attributions[combination_name][filename].append(read_csv(
-                        attribution_path,
-                        seed=seed,
-                        model="gnn",
-                        source="gnn",
-                        use_env_features=use_env,
-                        use_phylo_features=use_phylo,
-                    ))
                 progress.update()
 
     LOGGER.info("All training jobs completed; aggregating CSV files")
@@ -274,20 +238,6 @@ def main() -> None:
         name: {filename: [] for filename in ATTRIBUTION_FILES}
         for _, _, name in FEATURE_COMBINATIONS
     }
-
-    # Deterministic baselines: replicate available frames for each combination and filename
-    for filename in result_files:
-        deterministic_results = sorted(deterministic_dir.glob(f"*/{filename}"))
-        deterministic_frames = [
-            read_csv(result, seed=deterministic_seed, model=result.parent.name, source="deterministic_baseline")
-            for result in deterministic_results
-        ]
-        for use_env, use_phylo, combination_name in FEATURE_COMBINATIONS:
-            for baseline_frame in deterministic_frames:
-                frame = baseline_frame.copy()
-                frame.insert(1, "use_env_features", use_env)
-                frame.insert(2, "use_phylo_features", use_phylo)
-                aggregated_predictions[filename][combination_name].append(frame)
 
     # Per-seed results: detect all seed_* directories and collect per-file
     for seed_dir in sorted(runs_dir.glob("seed_*")):
@@ -321,10 +271,13 @@ def main() -> None:
                 ))
 
                 # Collect baseline frames matching this result file type
-                baseline_results = sorted(baseline_dir.glob(f"*/{filename}"))
+                baseline_results = find_baseline_results(baseline_dir, BASELINES, filename)
                 baseline_frames = [
-                    read_csv(result, seed=seed, model=result.parent.name, source="r_baseline")
-                    for result in baseline_results
+                    read_csv(
+                        result, seed=seed, model=result.parent.name,
+                        source=("deterministic_baseline" if model in DETERMINISTIC_BASELINES else "r_baseline"),
+                    )
+                    for model, result in baseline_results.items()
                 ]
                 for baseline_frame in baseline_frames:
                     frame = baseline_frame.copy()
