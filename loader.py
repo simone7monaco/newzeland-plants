@@ -27,8 +27,8 @@ from torch_geometric.transforms import KNNGraph, BaseTransform
 from torch_geometric.data import Data, HeteroData, InMemoryDataset
 from torch_geometric.utils import from_networkx, subgraph, bipartite_subgraph
 
-FEATURE_CACHE_VERSION = 2
-PROCESSED_DATA_VERSION = 5
+FEATURE_CACHE_VERSION = 3
+PROCESSED_DATA_VERSION = 6
 
 
 def _yj_transform(x: np.ndarray, lmbda: float) -> np.ndarray:
@@ -280,7 +280,15 @@ class PlantDataset(InMemoryDataset):
         self.load(self.processed_paths[0])
     
     @staticmethod
-    def load_raster(f, grid_step=.1, max_window_pixels=1_000_000):
+    def load_raster(f, 
+                    grid_step=.1, 
+                    max_window_pixels=1_000_000,
+                    aggregation='sum'
+        ):
+        """Load and coarsen a raster.  
+        Use ``sum`` for occurrence/count rasters and ``mean`` for continuous
+        environmental covariates so that coarsening preserves their scale.
+        """
         if f.exists():
             raster = xr.open_dataarray(f, engine="rasterio")
         else:
@@ -288,7 +296,7 @@ class PlantDataset(InMemoryDataset):
             raster_list = [xr.open_dataarray(subsp_f, engine="rasterio") for subsp_f in f.parent.glob(f"{f.stem.split('_distribution')[0]}*{f.suffix}")]
             if not raster_list:
                 raise FileNotFoundError(f"No distribution raster or matching subspecies rasters found for {f}")
-            aligned_rasters = xr.align(*raster_list, join="outer", fill_value=0)
+            aligned_rasters = xr.align(*raster_list, join="outer", fill_value=0)  # type: ignore
             raster = xr.concat(aligned_rasters, dim="subspecies").sum("subspecies", skipna=True)
 
         current_step = abs(float((raster.x[1] - raster.x[0]).values))  # degrees
@@ -313,9 +321,17 @@ class PlantDataset(InMemoryDataset):
         for start in range(0, trimmed_height, rows_per_window):
             stop = min(start + rows_per_window, trimmed_height)
             window = raster.isel(y=slice(start, stop), x=slice(0, trimmed_width)).load()
-            chunks.append(
-                window.coarsen(x=downsample, y=downsample, boundary='trim').sum().fillna(0) # type: ignore
-            )
+            coarsened = window.coarsen(
+                     x=downsample, y=downsample, boundary='trim'
+                )
+            if aggregation == 'sum':
+                chunk = coarsened.sum().fillna(0)  # type: ignore
+            else:
+                # Keep all-missing environmental cells as NaN rather than
+                # introducing an artificial zero in physical units.
+                chunk = coarsened.mean(skipna=True)  # type: ignore
+            chunks.append(chunk)
+            
         return xr.concat(chunks, dim='y')
     
     
@@ -520,7 +536,7 @@ class PlantDataset(InMemoryDataset):
             return pd.read_csv(df_path, index_col=0)
         
         for f in tqdm(sorted((Path(self.root) / "Complete layers" / data_path).rglob('*.tif')), desc=f'Loading {data_path}'):
-            raster = self.load_raster(f)
+            raster = self.load_raster(f, aggregation='mean')
             interpolated_raster = raster.interp(x=self.space_df.x.values, y=self.space_df.y.values, method='nearest')
             for band in interpolated_raster.band.values:
                 band_raster = interpolated_raster.sel(band=band).to_pandas().reset_index().melt(id_vars=['y'])
@@ -601,7 +617,7 @@ class PlantDataset(InMemoryDataset):
         return self.species_graph
 
     def get_spatial_graph(self, n_clusters=50, k=6):
-        all_occurrences = self.load_raster(Path(self.root)/"Distribution layers/_all_species_distributions.tif")
+        all_occurrences = self.load_raster(Path(self.root)/"Distribution layers/_all_species_distributions.tif", aggregation='sum')
         self.space_df = all_occurrences.isel(band=0).to_pandas().reset_index().melt(id_vars=['y']).rename(columns={'value': 'occurrence'})
         self.space_df.x = self.space_df.x.astype(float)
         self.space_df.y = self.space_df.y.astype(float)
@@ -616,7 +632,7 @@ class PlantDataset(InMemoryDataset):
         return self.spatial_graph
 
     def get_distribution(self, dist_path):
-        ar = self.load_raster(dist_path)
+        ar = self.load_raster(dist_path, aggregation='sum')
 
         ar = ar.where(ar > 0, 0)
         ar = ar.where(ar.isnull(), 1)
@@ -640,7 +656,7 @@ class PlantDataset(InMemoryDataset):
         if index_space_specie.empty:
             raw_paths = [self.raw_dir / filename for filename in self.get_raw_file_names()]
             for f in tqdm(raw_paths, desc='Processing distribution layers'):
-                raster = self.load_raster(f)
+                raster = self.load_raster(f, aggregation='sum')
                 species_name = Path(f).stem.rsplit('_', 1)[0]
                 # raster = raster.sel(x=space_df.x.values, y=space_df.y.values, method='nearest')
                 occurence_df = raster.isel(band=0).to_pandas().reset_index().melt(id_vars=['y']).rename(columns={'value': 'occurrence'}).astype(np.float32)

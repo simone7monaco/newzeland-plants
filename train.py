@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from loader import PlantDataset, NormalizeFeatures, data_split
 from models import TraitsPredictor, DeterministicLoss, MixedNLLLoss, MultiTargetDeterministicLoss, graph_smoothness_loss
-from soft_delete.baselines_training import compute_correlation
+# from soft_delete.baselines_training import compute_correlation
 from tester import Tester, fit_conformal_residual_bounds, fit_conformal_residual_bounds_minmax
 from tqdm import trange
 from pathlib import Path
@@ -311,19 +311,19 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
                     ).sqrt()
                     correlation_target = primary_target.clone()
                     correlation_target[~validation_mask] = float('nan')
-                    correlation = compute_correlation(primary_prediction, correlation_target)
+                    # correlation = compute_correlation(primary_prediction, correlation_target)
 
                     if validation_loss.item() < best_validation_loss:
                         best_validation_loss = validation_loss.item()
                         best_validation_rmse = validation_rmse.item() if not torch.isnan(validation_rmse) else float('nan')
-                        best_validation_correlation = float(correlation)
+                        # best_validation_correlation = float(correlation)
                         best_epoch = epoch
                         best_model = deepcopy(model.state_dict())
                     
                     log_dict = {
                         'validation_loss': validation_loss.item(),
                         'validation_mean_rmse': validation_rmse.item() if not torch.isnan(validation_rmse) else float('nan'),
-                        'validation_correlation': float(correlation),
+                        # 'validation_correlation': float(correlation),
                         'lr': optimizer.param_groups[0]['lr'],
                     } | loss_fn.cache
                     if args.use_wb:
