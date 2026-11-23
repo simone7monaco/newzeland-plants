@@ -8,6 +8,7 @@ from tqdm import tqdm
 import itertools
 import pandas as pd
 import re
+import hashlib
 from Bio import Phylo
 import networkx as nx
 
@@ -21,6 +22,7 @@ from node2vec import Node2Vec
 from sklearn.cluster import SpectralClustering
 from sklearn.model_selection import GroupKFold, KFold
 from scipy.stats import yeojohnson as _scipy_yeojohnson
+from scipy.spatial import cKDTree
 
 import torch
 from torch_geometric.transforms import KNNGraph, BaseTransform
@@ -28,7 +30,7 @@ from torch_geometric.data import Data, HeteroData, InMemoryDataset
 from torch_geometric.utils import from_networkx, subgraph, bipartite_subgraph
 
 FEATURE_CACHE_VERSION = 3
-PROCESSED_DATA_VERSION = 6
+PROCESSED_DATA_VERSION = 9
 
 
 def _yj_transform(x: np.ndarray, lmbda: float) -> np.ndarray:
@@ -68,7 +70,11 @@ def _yj_inverse(y: np.ndarray, lmbda: float) -> np.ndarray:
 class NormalizeFeatures(BaseTransform):
     r"""Normalizes graph attributes; traits can use per-column Yeo-Johnson + z, others use z or sin/cos."""
     def __init__(self, trait_norm_mean='yj', trait_norm_std='z',
-                 trait_norm_min='yj', trait_norm_max='yj', trait_norm_range='yj'):
+                 trait_norm_min='yj', trait_norm_max='yj', trait_norm_range='yj', shared_bounds=False):
+
+        if shared_bounds and trait_norm_min != trait_norm_max:
+            raise ValueError('Ordered bounds require the same normalization mode for min and max.')
+        self.shared_bounds = shared_bounds
 
         self.normalizations = {
             'spatial_x': 'sincos', # They are latitude and longitude
@@ -161,6 +167,14 @@ class NormalizeFeatures(BaseTransform):
                 pass
             else:
                 raise ValueError(f"Unknown normalization: {self.normalizations[k_norm]}")
+        if self.shared_bounds:
+            if 'species_x_min' not in self.props or 'species_x_max' not in self.props:
+                raise ValueError('Ordered bounds require fitted min and max features.')
+            # The same monotone mapping is essential: separately fitted maps can
+            # reverse the order after inversion even when normalized min <= max.
+            self.props['species_x_max'] = {
+                name: value.clone() for name, value in self.props['species_x_min'].items()
+            }
             
     def transform(self, data: Data, eps: float = 1e-6) -> Data:
         return self.forward(data, eps)
@@ -262,12 +276,21 @@ torch.serialization.add_safe_globals([NZData])
 
 class PlantDataset(InMemoryDataset):
     def __init__(self, root, transform=None, pre_transform=None, pre_filter=None,
-                 trait_representation='min_max_range', traits_filename='Traits.xlsx',
-                 invalid_bounds_policy='missing'):
+                 trait_representation='min_max_range', traits_filename=None,
+                 invalid_bounds_policy='missing', include_unobserved_species=False):
         self.trait_representation = trait_representation
         self.pivot_feature = 'traits_mean' if self.trait_representation == 'mean_std' else 'traits_min'
-        self.traits_filename = traits_filename
+        self.traits_filename = traits_filename or ('Traits.xlsx' if trait_representation == 'mean_std' else 'FernMinMax_all.xlsx')
         self.invalid_bounds_policy = invalid_bounds_policy
+        self.include_unobserved_species = include_unobserved_species
+        trait_path = Path(root) / self.traits_filename
+        if not trait_path.exists():
+            raise FileNotFoundError(f'Trait workbook not found: {trait_path}')
+        self.traits_fingerprint = hashlib.sha256(trait_path.read_bytes()).hexdigest()[:16]
+        tree_path = next(Path(root).glob('*.nwk'), None)
+        if tree_path is None:
+            raise FileNotFoundError(f'Phylogenetic tree file not found in {root}')
+        self.tree_fingerprint = hashlib.sha256(tree_path.read_bytes()).hexdigest()[:16]
         self.get_traits_df(
             root,
             trait_representation=trait_representation,
@@ -446,7 +469,7 @@ class PlantDataset(InMemoryDataset):
             if missing_range:
                 print(f"Warning: Range was calculated from Min/Max for: {missing_range}")
             self.traits_range = pd.DataFrame({
-                trait_name: trait_values[columns['range']]
+                trait_name: trait_values[columns['range']].fillna(calculated_range[trait_name])
                 if 'range' in columns else calculated_range[trait_name]
                 for trait_name, columns in selected_traits.items()
             }, index=trait_values.index)
@@ -485,6 +508,15 @@ class PlantDataset(InMemoryDataset):
             for frame in (self.traits_min, self.traits_max, self.traits_range):
                 frame.mask(incomplete_bounds, inplace=True)
 
+        # Decide eligibility after validation and missing-value harmonization;
+        # retain the source workbook and names for explicit recovery.
+        observed = getattr(self, self.pivot_feature).notna().any(axis=1)
+        self.unobserved_species = observed.index[~observed].tolist()
+        if not self.include_unobserved_species:
+            for attr in ('traits_mean', 'traits_std', 'traits_min', 'traits_max', 'traits_range', 'traits_gen'):
+                if hasattr(self, attr):
+                    setattr(self, attr, getattr(self, attr).loc[observed].copy())
+
         for cl_feat in categorical_columns:
             for cl in self.traits_gen[cl_feat].unique(): # type: ignore
                 if self.traits_gen[cl_feat].eq(cl).sum() < len(self.traits_gen) * dummy_threshold and not pd.isna(cl):
@@ -516,7 +548,8 @@ class PlantDataset(InMemoryDataset):
         return [str(self.raw_dir / filename) for filename in self.get_raw_file_names()]
 
     def get_processed_file_names(self):
-        return [f'heterodata_{self.trait_representation}_v{PROCESSED_DATA_VERSION}.pt']
+        coverage = 'all' if self.include_unobserved_species else 'observed'
+        return [f'heterodata_{self.trait_representation}_{self.invalid_bounds_policy}_{coverage}_{self.traits_fingerprint}_{self.tree_fingerprint}_v{PROCESSED_DATA_VERSION}.pt']
 
     @property
     def processed_file_names(self):
@@ -527,7 +560,9 @@ class PlantDataset(InMemoryDataset):
         return [str(Path(self.processed_dir) / filename) for filename in self.get_processed_file_names()]
 
     def _download(self):
-        raise RuntimeError('Dataset not found.')
+        # A missing distribution raster means that a species has no spatial
+        # connections; it must not remove the species from the dataset.
+        return
 
     def load_complete(self, data_path):
         comp_rasters = []
@@ -645,27 +680,36 @@ class PlantDataset(InMemoryDataset):
         soil_rasters = self.load_complete('Soil NZ layers')
 
         self.global_data = pd.concat([clim_rasters, population_elevation_rasters, soil_rasters], axis=1)
-        index_space_specie_path = Path(self.root) / 'index_space_specie.csv'
+        coverage = 'all' if self.include_unobserved_species else 'observed'
+        index_space_specie_path = Path(self.root) / f'index_space_specie_{coverage}_{self.traits_fingerprint}_v{PROCESSED_DATA_VERSION}.csv'
         if index_space_specie_path.exists():
             index_space_specie = pd.read_csv(index_space_specie_path)
             required_columns = {'cluster', 'species', 'occurrence'}
             if not required_columns.issubset(index_space_specie.columns):
-                index_space_specie = pd.DataFrame()
+                raise ValueError(f'Invalid species-occurrence cache: {index_space_specie_path}')
+            index_space_specie = index_space_specie[['cluster', 'species', 'occurrence']].copy()
         else:
-            index_space_specie = pd.DataFrame()
-        if index_space_specie.empty:
-            raw_paths = [self.raw_dir / filename for filename in self.get_raw_file_names()]
-            for f in tqdm(raw_paths, desc='Processing distribution layers'):
-                raster = self.load_raster(f, aggregation='sum')
-                species_name = Path(f).stem.rsplit('_', 1)[0]
-                # raster = raster.sel(x=space_df.x.values, y=space_df.y.values, method='nearest')
-                occurence_df = raster.isel(band=0).to_pandas().reset_index().melt(id_vars=['y']).rename(columns={'value': 'occurrence'}).astype(np.float32)
-                occurence_df = occurence_df[occurence_df.occurrence > 0]
-                # for each x, y; find the closest point in the space_df
-                occurence_df[['x', 'y']] = occurence_df[['x', 'y']].apply(lambda x: self.space_df.iloc[(self.space_df[['x', 'y']] - x).pow(2).sum(1).idxmin()][['x', 'y']], axis=1)
-                occurence_df = occurence_df.set_index(['x', 'y']).join(self.space_df.set_index(['x', 'y']))
-                index_space_specie = pd.concat([occurence_df.groupby('cluster').sum().reset_index().assign(species=species_name),
-                                                index_space_specie,], axis=0, ignore_index=True)
+            index_space_specie = pd.DataFrame(columns=['cluster', 'species', 'occurrence'])
+            coord_tree = cKDTree(self.space_df[['x', 'y']].to_numpy(dtype=float))
+            grouped_occurrences = []
+            for species_name in tqdm(species_graph.node_names, desc='Processing species distribution layers'):
+                f = self.raw_dir / f'{species_name}_distribution.tif'
+                try:
+                    raster = self.load_raster(f, aggregation='sum')
+                except FileNotFoundError:
+                    warnings.warn(f'No distribution raster for {species_name}; retaining it without location edges.')
+                    continue
+                occurrences = raster.isel(band=0).to_pandas().reset_index().melt(id_vars=['y']).rename(columns={'value': 'occurrence'})
+                occurrences = occurrences.loc[occurrences.occurrence > 0].copy()
+                if occurrences.empty:
+                    continue
+                _, indices = coord_tree.query(occurrences[['x', 'y']].to_numpy(dtype=float))
+                occurrences['cluster'] = self.space_df.iloc[indices]['cluster'].to_numpy()
+                grouped = occurrences.groupby('cluster', as_index=False)['occurrence'].sum()
+                grouped['species'] = species_name
+                grouped_occurrences.append(grouped)
+            if grouped_occurrences:
+                index_space_specie = pd.concat(grouped_occurrences, ignore_index=True)
 
         species_to_index = {species: index for index, species in enumerate(species_graph.node_names)}
         index_space_specie['species_idx'] = index_space_specie.species.map(species_to_index)
@@ -717,11 +761,28 @@ class PlantDataset(InMemoryDataset):
         return data
         
 
+def stable_species_folds(species_names, seed):
+    """Return repeatable fold IDs unaffected by ordering or other species."""
+    if len(species_names) != len(set(species_names)):
+        raise ValueError('Species names must be unique for stable cross-validation.')
+    return np.array([
+        int.from_bytes(hashlib.sha256(f'{seed}:{name}'.encode()).digest()[:8], 'big') % 5
+        for name in species_names
+    ])
+
+
 def data_split(data, test_size=0.3, k=0, seed=42, split_strategy='random'):
     n_species = data.species_num_nodes
     if split_strategy == 'random':
         splitter = KFold(n_splits=5, random_state=seed, shuffle=True)
         splits = list(splitter.split(np.arange(n_species)))
+    elif split_strategy == 'stable':
+        # A species keeps the same fold when other species are added/removed.
+        # This makes the overlap between two taxon sets directly comparable.
+        fold_ids = stable_species_folds(data.species_names, seed)
+        if any((fold_ids == i).sum() == 0 for i in range(5)):
+            raise ValueError('Stable split produced an empty test fold.')
+        splits = [(np.flatnonzero(fold_ids != i), np.flatnonzero(fold_ids == i)) for i in range(5)]
     elif split_strategy == 'louvain':
         graph = nx.Graph()
         graph.add_nodes_from(range(n_species))
@@ -741,7 +802,7 @@ def data_split(data, test_size=0.3, k=0, seed=42, split_strategy='random'):
         splitter = GroupKFold(n_splits=5)
         splits = list(splitter.split(np.arange(n_species), groups=groups))
     else:
-        raise ValueError("split_strategy must be 'random' or 'louvain'.")
+        raise ValueError("split_strategy must be 'random', 'stable', or 'louvain'.")
 
     if not 0 <= k < len(splits):
         raise ValueError(f'Fold index {k} is outside [0, {len(splits) - 1}].')
@@ -804,5 +865,3 @@ if __name__ == '__main__':
         #     n = n.split('-')
         # if not torch.allclose(data[n][k], re_unnormed_data[n][k]):
         #     print(f"Normalization failed for {n}: {k} (max diff: {torch.max(torch.abs(data[n][k] - re_unnormed_data[n][k]))})")
-
-    

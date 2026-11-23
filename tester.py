@@ -37,6 +37,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 import wandb
+from occlusion import group_for_trait
 
 
 # =====================================================================
@@ -89,18 +90,20 @@ def leave_one_trait_out(model, data, test_indices, device):
             continue
 
         d = data.clone().to(device)
-        mask_global = test_indices[test_has_j]
+        mask_global = test_indices
+        groups = getattr(model, 'occlusion_groups', None) or [(i,) for i in range(n_traits)]
+        target_group = list(group_for_trait(groups, j))
 
         # Hide trait j for selected test species
         if trait_mode == 'mean_std':
-            d.species_x_mean[mask_global, j] = 0.0
-            d.species_x_std[mask_global, j] = 0.0
+            d.species_x_mean[mask_global[:, None], target_group] = 0.0
+            d.species_x_std[mask_global[:, None], target_group] = 0.0
         else:
-            d.species_x_min[mask_global, j] = 0.0
-            d.species_x_max[mask_global, j] = 0.0
+            d.species_x_min[mask_global[:, None], target_group] = 0.0
+            d.species_x_max[mask_global[:, None], target_group] = 0.0
             if trait_mode.endswith('range'):
-                d.species_x_range[mask_global, j] = 0.0
-        d.traits_nanmask[mask_global, j] = True
+                d.species_x_range[mask_global[:, None], target_group] = 0.0
+        d.traits_nanmask[mask_global[:, None], target_group] = True
 
         local_idx = torch.where(test_has_j)[0]
         eval_mask[local_idx, j] = True
@@ -108,17 +111,17 @@ def leave_one_trait_out(model, data, test_indices, device):
 
         if trait_mode == 'mean_std':
             pm_full, ps_full = out
-            pred_mean_out[local_idx, j] = pm_full[mask_global, j]
-            pred_std_out[local_idx, j] = ps_full[mask_global, j]
+            pred_mean_out[local_idx, j] = pm_full[test_indices[test_has_j], j]
+            pred_std_out[local_idx, j] = ps_full[test_indices[test_has_j], j]
         else:
             if trait_mode.endswith('range'):
                 pmin_full, pmax_full, pr_full = out
-                pred_range_out[local_idx, j] = pr_full[mask_global, j]
+                pred_range_out[local_idx, j] = pr_full[test_indices[test_has_j], j]
             else:
                 pmin_full, pmax_full = out
 
-            pred_min_out[local_idx, j] = pmin_full[mask_global, j]
-            pred_max_out[local_idx, j] = pmax_full[mask_global, j]
+            pred_min_out[local_idx, j] = pmin_full[test_indices[test_has_j], j]
+            pred_max_out[local_idx, j] = pmax_full[test_indices[test_has_j], j]
 
     if trait_mode == 'mean_std':
         return {'mode': trait_mode, 'pred_mean': pred_mean_out, 
@@ -395,16 +398,16 @@ def apply_conformal_residual_bounds_minmax(
 # Part 2 — XAI: Integrated Gradients
 # =====================================================================
 
-def _mask_target_trait_for_imputation(data, test_indices, trait_index, var_names):
+def _mask_target_trait_for_imputation(data, test_indices, trait_index, var_names, groups=None):
     """Apply the same target-trait mask used by leave-one-trait-out evaluation."""
 
     for var_n in var_names:
         values = getattr(data, f'species_x_{var_n}')
         target_mask = torch.zeros_like(values, dtype=torch.bool)
-        target_mask[test_indices, trait_index] = True
+        target_mask[test_indices[:, None], list(group_for_trait(groups or [(trait_index,)], trait_index))] = True
         setattr(data, f'species_x_{var_n}', values.masked_fill(target_mask, 0.0))
     traits_nanmask = data.traits_nanmask.clone()
-    traits_nanmask[test_indices, trait_index] = True
+    traits_nanmask[test_indices[:, None], list(group_for_trait(groups or [(trait_index,)], trait_index))] = True
     data.traits_nanmask = traits_nanmask
 
 
@@ -507,7 +510,7 @@ def _species_ig(model, data, test_indices, trait_names, device,
                     dtmp.species_x_min, dtmp.species_x_max, dtmp.species_x_gen, dtmp.species_x_phylo = torch.split(
                                             chunk, [n_traits, n_traits, n_gen, n_phylo], dim=1
                                         )
-            _mask_target_trait_for_imputation(dtmp, test_indices, active_target_trait[0], var_names)
+            _mask_target_trait_for_imputation(dtmp, test_indices, active_target_trait[0], var_names, getattr(model, 'occlusion_groups', None))
             dtmp.num_nodes = n_species_nodes + data_dev.spatial_num_nodes
             if first_call and i == 0:
                 # spatial features must be untouched by species-side perturbation
@@ -697,11 +700,12 @@ def _spatial_ig(model, data, test_indices, trait_names,
             dtmp.spatial_x, dtmp.spatial_global_data = torch.split(
                 chunk, [n_spatial_x, chunk.size(1) - n_spatial_x], dim=1
             )
-            _mask_target_trait_for_imputation(dtmp, test_indices, active_target_trait[0], var_names)
+            _mask_target_trait_for_imputation(dtmp, test_indices, active_target_trait[0], var_names, getattr(model, 'occlusion_groups', None))
             dtmp.num_nodes = n_sp_nodes + n_sa_nodes
             if first_call and i == 0:
                 expected_pivot = data_dev[pivot_variable].detach().clone()
-                expected_pivot[test_indices, active_target_trait[0]] = 0.0
+                group = group_for_trait(getattr(model, 'occlusion_groups', None) or [(active_target_trait[0],)], active_target_trait[0])
+                expected_pivot[test_indices[:, None], list(group)] = 0.0
                 assert torch.equal(
                     dtmp[pivot_variable].detach(), expected_pivot
                 ), f"{pivot_variable} did not preserve the expected target mask"
@@ -1489,7 +1493,7 @@ class Tester:
                 print("  Spatial IG skipped (use_env_features=False).")
 
             (save_dir / "attributions_metadata.json").write_text(json.dumps({
-                "protocol": "leave_one_trait_out_target_masked",
+                "protocol": "grouped_target_masked" if getattr(model, 'occlusion_groups', None) else "leave_one_trait_out_target_masked",
                 "target_trait_masked": True,
                 "trait_representation": trait_mode,
                 "n_ig_steps": n_ig_steps,

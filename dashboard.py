@@ -19,7 +19,7 @@ DEFAULT_RESULTS_DIR = (
     if (PROJECT_ROOT / "benchmark_results").exists()
     else PROJECT_ROOT / "results"
 )
-DEFAULT_TRAITS_FILE = PROJECT_ROOT / "data" / "Ferns" / "FernMinMax.xlsx"
+DEFAULT_TRAITS_FILE = PROJECT_ROOT / "data" / "Ferns" / "FernMinMax_all.xlsx"
 
 # Maps run_benchmark.py's feature-combination folder names to the dashboard's configuration ids.
 BENCHMARK_CONFIG_MAP = {
@@ -185,6 +185,19 @@ def trait_scales(traits_file: Path) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(records)
+
+
+def infer_traits_file(results_dir: Path) -> Path:
+    """Select a workbook only when a complete saved prediction species set matches it."""
+    candidates = [PROJECT_ROOT / 'data/Ferns/FernMinMax_all.xlsx', PROJECT_ROOT / 'data/Ferns/FernMinMax.xlsx']
+    predictions = sorted(results_dir.glob('runs/seed_*/gnn/*/*/predictions_original_all_folds.csv'))
+    for file in predictions[:4]:
+        frame = pd.read_csv(file, usecols=['species'])
+        species = set(frame['species'].dropna())
+        matches = [p for p in candidates if p.exists() and set(pd.read_excel(p, usecols=['Species'])['Species'].dropna()) == species]
+        if len(matches) == 1:
+            return matches[0]
+    raise ValueError('Cannot identify the trait workbook from saved complete species predictions; specify it explicitly.')
 
 
 def is_benchmark_layout(results_dir: Path) -> bool:
@@ -1227,15 +1240,18 @@ def main() -> None:
     with st.sidebar:
         st.header("Controlli")
         results_path = Path(st.text_input("Directory risultati", str(DEFAULT_RESULTS_DIR))).expanduser()
+        try:
+            detected_traits = infer_traits_file(results_path)
+        except ValueError:
+            detected_traits = DEFAULT_TRAITS_FILE
+            st.warning('Impossibile identificare automaticamente il workbook: verifica il percorso selezionato.')
+        traits_path = Path(st.text_input('Workbook tratti per IQR', str(detected_traits))).expanduser()
         correlation_floor = st.slider("Correlazione minima per uso interpretativo", 0.0, 0.9, 0.5, 0.05)
         relative_rmse_limit = st.slider("RMSE/IQR massimo per uso interpretativo", 0.25, 2.0, 1.0, 0.05)
         selected_metric = st.selectbox("Metrica di confronto", list(METRIC_OPTIONS))
         if st.button("Ricarica dati", type="secondary"):
             st.cache_data.clear()
 
-    traits_path = results_path.parent / "data" / "Ferns" / "FernMinMax.xlsx"
-    if not traits_path.exists():
-        traits_path = DEFAULT_TRAITS_FILE
     metric_rows = cached_metric_rows(str(results_path), str(traits_path))
     if metric_rows.empty:
         st.error(f"Nessuna metrica per fold trovata in {results_path}.")

@@ -8,6 +8,7 @@ from torch_geometric.utils import subgraph, bipartite_subgraph
 from torch_geometric.data import HeteroData
 import torch_geometric
 from torch_geometric import nn as pyg_nn
+from occlusion import grouped_random_mask
 
 
 class GNN(nn.Module):
@@ -62,11 +63,18 @@ class TraitsPredictor(nn.Module):
     def __init__(self, in_traits, in_gen, in_phylo, in_space, hidden_channels, out_channels, 
                  num_layers, dropout=0.3, gnn_module='GATConv', eps=1e-6, mask_ratio=0.15, 
                  mask_strategy='random', use_env_features=True, use_phylo_features=True,
-                 trait_feature_keys=('species_x_min', 'species_x_max', 'species_x_range')):
+                 trait_feature_keys=('species_x_min', 'species_x_max', 'species_x_range'), occlusion_groups=None,
+                 bounds_parameterization='independent'):
         super(TraitsPredictor, self).__init__()
 
         gnn = getattr(pyg_nn, gnn_module)
         self.trait_feature_keys = trait_feature_keys
+        self.occlusion_groups = occlusion_groups
+        if bounds_parameterization not in {'independent', 'min_plus_range_relu', 'min_plus_range_softplus'}:
+            raise ValueError(f'Unknown bounds parameterization: {bounds_parameterization}')
+        if bounds_parameterization != 'independent' and tuple(trait_feature_keys) != ('species_x_min', 'species_x_max'):
+            raise ValueError('Ordered bounds require exactly min and max features, without a separate range output.')
+        self.bounds_parameterization = bounds_parameterization
 
         # if trait_representation == 'mean_std'
         # self.trait_feature_keys = ('species_x_mean', 'species_x_std')
@@ -99,6 +107,10 @@ class TraitsPredictor(nn.Module):
         # starts at the training-fold mean and avoids explosive YJ inverses.
         nn.init.zeros_(self.fc.weight)
         nn.init.zeros_(self.fc.bias)
+        if bounds_parameterization == 'min_plus_range_relu':
+            # ReLU has zero derivative at zero; start the range branch positive.
+            with torch.no_grad():
+                self.fc.bias[out_channels:].fill_(1.0)
         self.eps = eps  # Small constant for numerical stability
         self.mask_ratio = mask_ratio  # Fraction of observed traits to mask during training
         self.mask_strategy = mask_strategy  # 'random', 'blockwise', or 'balanced'
@@ -150,8 +162,12 @@ class TraitsPredictor(nn.Module):
                         reconstruction_mask[mask_indices, trait_idx] = True
             else:  # 'random' (default)
                 # Randomly select observed entries to mask for reconstruction
-                reconstruction_mask = torch.rand_like(species_traits) < self.mask_ratio
-                reconstruction_mask = reconstruction_mask & observed_mask  # Only mask observed entries
+                groups = self.occlusion_groups or [(i,) for i in range(species_traits.size(1))]
+                reconstruction_mask = grouped_random_mask(observed_mask, groups, self.mask_ratio)
+            if self.occlusion_groups and self.mask_strategy != 'random':
+                for group in self.occlusion_groups:
+                    selected = reconstruction_mask[:, list(group)].any(dim=1)
+                    reconstruction_mask[:, list(group)] = selected[:, None] & observed_mask[:, list(group)]
         return reconstruction_mask
         
     def forward(self, data: HeteroData, return_attention_weights=None):
@@ -217,6 +233,10 @@ class TraitsPredictor(nn.Module):
         species_embeddings = species_embeddings.relu()
 
         predictions = self.fc(species_embeddings).chunk(len(self.trait_feature_keys), dim=-1)
+        if self.bounds_parameterization != 'independent':
+            minimum, raw_range = predictions
+            width = F.relu(raw_range) if self.bounds_parameterization == 'min_plus_range_relu' else F.softplus(raw_range)
+            predictions = (minimum, minimum + width)
         if 'species_x_std' in self.trait_feature_keys:
             mean, log_std = predictions
             # Apply softplus to log_std and add epsilon: sigma = softplus(log_std) + eps.

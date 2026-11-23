@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 from loader import PlantDataset, data_split
+from occlusion import trait_groups, group_for_trait
 from tester import compute_metrics_minmax
 from pathlib import Path
 import pandas as pd
@@ -149,8 +150,11 @@ def get_args():
         ),
     )
     parser.add_argument('--k', type=int, default=-1, help='Fold index for cross-validation (0-4). Use -1 to perform a complete run over all folds sequentially.')
-    parser.add_argument('--split_strategy', type=str, default='random', choices=['random', 'louvain'], help='Outer CV split: random is transductive; louvain requires balanced graph communities')
+    parser.add_argument('--split_strategy', type=str, default='random', choices=['random', 'stable', 'louvain'], help='Outer CV split: stable preserves species folds across dataset sizes')
+    parser.add_argument('--traits_filename', default='FernMinMax_all.xlsx', help='Trait workbook name within data/Ferns')
+    parser.add_argument('--include_unobserved_species', type=str2bool, nargs='?', const=True, default=False, help='Retain species with no observed target traits for exploratory inference')
     parser.add_argument('--seed', type=int, default=42, help='Random seed used for splitting and model fitting')
+    parser.add_argument('--occlusion_protocol', choices=['paired', 'individual'], default='paired', help='Mask fertile/sterile pairs jointly or reproduce individual-trait occlusion')
     parser.add_argument('--validation_mask_ratio', type=float, default=0.15, help='Fraction of observed outer-training cells held out for inner-validation metrics')
     parser.add_argument('--training_protocol', type=int, default=1, choices=[1, 2], help='Training protocol: 1 = fit on outer-training species only; 2 = fit on outer-training + inner-validation species (transductive)') 
     return parser.parse_args()
@@ -221,6 +225,9 @@ def evaluate_and_save(imputed_df: pd.DataFrame, test_data: Data, trait_names: li
         )
         for variable in variable_names
     }
+    # Phylogeny-only methods cannot predict species absent from the tree.
+    # Preserve their rows as NaN and score only available prediction pairs.
+    eval_mask = eval_mask & torch.isfinite(predictions['min']) & torch.isfinite(predictions['max'])
     truths = {
         variable: getattr(test_data, f'species_x_{variable}')[positions]
         for variable in variable_names
@@ -256,10 +263,12 @@ def main(args) -> None:
         data_path,
         transform=None,
         trait_representation='min_max_range',
-        traits_filename='FernMinMax.xlsx',
+        traits_filename=args.traits_filename,
         invalid_bounds_policy=args.invalid_bounds_policy,
+        include_unobserved_species=args.include_unobserved_species,
     )
     trait_names = dataset.trait_names
+    occlusion_groups = trait_groups(trait_names, args.occlusion_protocol)
     raw_data = cast(Data, dataset[0])
     data = raw_data.clone()
 
@@ -313,13 +322,14 @@ def main(args) -> None:
                 )
             if missing_test:
                 warnings.warn(
-                    f"{model_name} removed testing and evaluation species not present "
-                    f"in the phylogenetic tree: {missing_test}",
+                    f"{model_name} cannot predict test species absent from the "
+                    f"phylogenetic tree; their output rows remain missing: {missing_test}",
                     UserWarning,
                 )
             model_train_df = train_df.drop(index=missing_train)
             model_test_df = test_df.drop(index=missing_test)
-            evaluation_species = list(model_test_df.index)
+            # Keep all held-out taxa in the exported table; taxa absent from
+            # the tree remain NaN rather than receiving invented neighbours.
 
         imputed_df_all = pd.DataFrame(
             np.nan,
@@ -349,8 +359,9 @@ def main(args) -> None:
 
             for j in range(len(trait_names)):
                 columns_to_impute = [trait_col_names[variable][j] for variable in variable_names]
+                columns_to_mask = [trait_col_names[variable][idx] for variable in variable_names for idx in group_for_trait(occlusion_groups, j)]
                 masked_test_df = model_test_df.copy(deep=True)
-                masked_test_df.loc[:, columns_to_impute] = np.nan
+                masked_test_df.loc[:, columns_to_mask] = np.nan
                 if not isinstance(model, MICE):
                     masked_test_df = masked_test_df.loc[:, trait_columns]
 
@@ -363,8 +374,9 @@ def main(args) -> None:
         else:  # args.training_protocol == 2
             for j in range(len(trait_col_names[variable_names[0]])):
                 columns_to_impute = [trait_col_names[variable][j] for variable in variable_names]
+                columns_to_mask = [trait_col_names[variable][idx] for variable in variable_names for idx in group_for_trait(occlusion_groups, j)]
                 masked_test_df = model_test_df.copy(deep=True)
-                masked_test_df.loc[:, columns_to_impute] = np.nan
+                masked_test_df.loc[:, columns_to_mask] = np.nan
                 masked_df = pd.concat([model_train_df, masked_test_df], axis=0, verify_integrity=True)
                 if isinstance(model, MissForest):
                     imputed_df = model.fit_transform(masked_df)
@@ -380,7 +392,7 @@ def main(args) -> None:
                 else:
                     raise ValueError(f"Unknown model type: {type(model)}")
 
-                imputed_df_all.loc[:, columns_to_impute] = imputed_df.loc[model_test_df.index, columns_to_impute].to_numpy()
+                imputed_df_all.loc[model_test_df.index, columns_to_impute] = imputed_df.loc[model_test_df.index, columns_to_impute].to_numpy()
 
         save_dir = args.output_dir / f"{model_name.upper()}{args.model_dir_suffix}" / f'fold_{args.k}'
         evaluate_and_save(imputed_df_all, test_data, trait_names, trait_col_names, variable_names,
@@ -411,7 +423,9 @@ if __name__ == "__main__":
 |
 """)
 
-    args.model_dir_suffix = f"_prot{args.training_protocol}"
+    args.model_dir_suffix = f"_prot{args.training_protocol}_occlusion-{args.occlusion_protocol}"
+    if args.include_unobserved_species:
+        args.model_dir_suffix += '_include-unobserved'
     if args.use_env_features:
         args.model_dir_suffix += "_env"
     if args.use_phylo_features:

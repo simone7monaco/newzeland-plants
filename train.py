@@ -15,6 +15,7 @@ from copy import deepcopy
 import wandb
 import optuna
 import yaml
+from occlusion import trait_groups
 
 import matplotlib.pyplot as plt
 
@@ -49,20 +50,34 @@ torch.set_float32_matmul_precision('medium')
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
-def create_validation_mask(observed_mask: torch.Tensor, ratio: float, seed_value: int) -> torch.Tensor:
+def create_validation_mask(observed_mask: torch.Tensor, ratio: float, seed_value: int, groups=None) -> torch.Tensor:
     """Select a deterministic, per-trait validation subset while retaining training observations."""
     if not 0.0 < ratio < 1.0:
         raise ValueError('validation_mask_ratio must be between 0 and 1.')
 
     generator = torch.Generator(device=observed_mask.device).manual_seed(seed_value)
     validation_mask = torch.zeros_like(observed_mask, dtype=torch.bool)
-    for trait_index in range(observed_mask.size(1)):
-        observed_indices = torch.where(observed_mask[:, trait_index])[0]
+    groups = groups or [(i,) for i in range(observed_mask.size(1))]
+    for group in groups:
+        observed_indices = torch.where(observed_mask[:, list(group)].any(dim=1))[0]
         if observed_indices.numel() < 2:
             continue
         n_validation = min(max(1, round(observed_indices.numel() * ratio)), observed_indices.numel() - 1)
-        chosen = torch.randperm(observed_indices.numel(), generator=generator, device=observed_mask.device)[:n_validation]
-        validation_mask[observed_indices[chosen], trait_index] = True
+        order = torch.randperm(observed_indices.numel(), generator=generator, device=observed_mask.device)
+        remaining = observed_mask[:, list(group)].sum(dim=0)
+        selected_list = []
+        for index in observed_indices[order]:
+            present = observed_mask[index, list(group)]
+            if torch.any(present & (remaining <= 1)):
+                continue
+            selected_list.append(index)
+            remaining -= present.long()
+            if len(selected_list) == n_validation:
+                break
+        if not selected_list:
+            continue
+        selected = torch.stack(selected_list)
+        validation_mask[selected[:, None], torch.tensor(group, device=observed_mask.device)] = observed_mask[selected[:, None], torch.tensor(group, device=observed_mask.device)]
     return validation_mask
 
 
@@ -84,7 +99,11 @@ def get_args():
     parser.add_argument('--shuffle_phylo', type=str2bool, nargs='?', const=True, default=False, help='Whether to shuffle phylogenetic features (for ablation studies)')
     parser.add_argument('--output_dir', type=Path, default='results/', help='Directory to save results and models')
     parser.add_argument('--trait_representation', type=str, default='min_max_range', choices=['mean_std', 'min_max_range'], help='Trait representation to use (mean/std or min/max/range)')
+    parser.add_argument('--traits_filename', type=str, default=None, help='Trait workbook name within data/Ferns (defaults to the complete min/max workbook)')
+    parser.add_argument('--include_unobserved_species', type=str2bool, nargs='?', const=True, default=False, help='Retain species with no observed target traits for exploratory inference')
     parser.add_argument('--keep_range_features', type=str2bool, nargs='?', const=True, default=False, help='Whether to keep range features in the dataset (only relevant for min_max_range representation)')
+    parser.add_argument('--bounds_parameterization', choices=['independent', 'min_plus_range_relu', 'min_plus_range_softplus'], default='independent', help='Predict min and max independently, or min and a nonnegative range in a shared monotone transformed space')
+    parser.add_argument('--shared_bounds_normalization', type=str2bool, nargs='?', const=True, default=False, help='Use the minimum transformation for both bounds, including with the independent head for controlled comparisons')
     parser.add_argument('--invalid_bounds_policy', type=str, default='missing', choices=['missing', 'error', 'keep'], help='How to handle negative or inconsistent min/max/range records')
 
     parser.add_argument('--trait_norm_mean', type=str, default='logz', choices=['z', 'yj', 'logz'], help='Trait normalization mode for mean features')
@@ -94,7 +113,7 @@ def get_args():
     parser.add_argument('--trait_norm_range', type=str, default='yj', choices=['z', 'yj', 'logz'], help='Trait normalization mode for range features')
     parser.add_argument('--per_trait_loss', type=str2bool, nargs='?', const=True, default=True, help='Use per-trait loss reduction instead of flat entry-wise averaging')
     parser.add_argument('--k', type=int, default=-1, help='Fold index for cross-validation (0-4). Use -1 to perform a complete run over all folds sequentially.')
-    parser.add_argument('--split_strategy', type=str, default='random', choices=['random', 'louvain'], help='Outer CV split: random is transductive; louvain requires balanced graph communities')
+    parser.add_argument('--split_strategy', type=str, default='random', choices=['random', 'stable', 'louvain'], help='Outer CV split: stable preserves species folds across dataset sizes')
     parser.add_argument('--seed', type=int, default=42, help='Random seed used for splitting and training')
 
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for the optimizer')
@@ -106,6 +125,7 @@ def get_args():
 
     parser.add_argument('--loss', type=str, default='deterministic', choices=['deterministic', 'dist_normal', 'dist_lognormal'], help='Output distribution type')
     parser.add_argument('--mask_ratio', type=float, default=0.15, help='Masking ratio for input features at training time')
+    parser.add_argument('--occlusion_protocol', choices=['paired', 'individual'], default='paired', help='Mask fertile/sterile pairs jointly or reproduce individual-trait occlusion')
     parser.add_argument('--kl_weight', type=float, default=1.0, help='Weight for the KL divergence loss term')
     parser.add_argument('--smoothness_weight', type=float, default=0.0, help='Weight for the graph smoothness loss')
     parser.add_argument('--visible_loss_weight', type=float, default=0.2, help='Weight for the reconstruction loss on visible (non-masked) entries')
@@ -131,6 +151,10 @@ def get_args():
 
 
 def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float:
+    if args.bounds_parameterization != 'independent' and (args.trait_representation != 'min_max_range' or args.keep_range_features):
+        raise ValueError('Ordered bounds require min_max_range representation with --keep_range_features false.')
+    if args.shared_bounds_normalization and args.trait_representation != 'min_max_range':
+        raise ValueError('Shared bounds normalization requires the min_max_range representation.')
     if args.use_wb:
         wandb.init(project='fern-sweep', config=args, mode='online')
     else:
@@ -145,17 +169,20 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
         trait_norm_min=args.trait_norm_min,
         trait_norm_max=args.trait_norm_max,
         trait_norm_range=args.trait_norm_range,
+        shared_bounds=args.shared_bounds_normalization or args.bounds_parameterization != 'independent',
     )
     data_path = Path(f'data/Ferns/')
-    trait_file = 'Traits.xlsx' if args.trait_representation == 'mean_std' else 'FernMinMax.xlsx'
+    trait_file = args.traits_filename or ('Traits.xlsx' if args.trait_representation == 'mean_std' else 'FernMinMax_all.xlsx')
     dataset = PlantDataset(
         data_path,
         transform=None,
         trait_representation=args.trait_representation,
         traits_filename=trait_file,
         invalid_bounds_policy=args.invalid_bounds_policy,
+        include_unobserved_species=args.include_unobserved_species,
     )
     trait_names = dataset.trait_names
+    occlusion_groups = trait_groups(trait_names, args.occlusion_protocol)
     raw_data = cast(Data, dataset[0])
 
     if args.shuffle_phylo:
@@ -183,12 +210,13 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
                             hidden_channels=args.hidden_channels, num_layers=args.num_layers,
                             dropout=args.dropout, gnn_module=args.gnn_module, use_env_features=args.use_env_features,
                             use_phylo_features=args.use_phylo_features, mask_ratio=args.mask_ratio,
-                            trait_feature_keys=trait_feature_keys)
+                            trait_feature_keys=trait_feature_keys, occlusion_groups=occlusion_groups,
+                            bounds_parameterization=args.bounds_parameterization)
 
     train_data, _ = data_split(data, k=args.k, seed=seed, split_strategy=args.split_strategy)
 
 
-    validation_mask = create_validation_mask(~train_data.traits_nanmask, args.validation_mask_ratio, seed + args.k)
+    validation_mask = create_validation_mask(~train_data.traits_nanmask, args.validation_mask_ratio, seed + args.k, occlusion_groups)
     if not validation_mask.any():
         raise ValueError('No observed cells are available for the inner validation mask.')
     validation_targets = tuple(getattr(train_data, key).clone() for key in trait_feature_keys)
@@ -443,6 +471,12 @@ if __name__ == "__main__":
     if args.trait_representation == 'min_max_range':
         exp_name += f"_bounds{args.invalid_bounds_policy}"
     exp_name += "_ptr" if args.per_trait_loss else "_flat"
+    exp_name += f"_occlusion-{args.occlusion_protocol}"
+    if args.include_unobserved_species:
+        exp_name += '_include-unobserved'
+    exp_name += f"_bounds-head-{args.bounds_parameterization}"
+    if args.shared_bounds_normalization or args.bounds_parameterization != 'independent':
+        exp_name += '_shared-bounds-norm'
     if exp_name.endswith('_'):
         exp_name = exp_name[:-1]
     args.output_dir = Path(args.output_dir) / exp_name.upper()

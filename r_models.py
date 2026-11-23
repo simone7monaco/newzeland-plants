@@ -675,7 +675,16 @@ class Rphylopars:
         ) = self._load_r()
 
         tree = ape.read_tree(str(tree_path))
-        tip_labels = [str(label) for label in tree.rx2("tip.label")]
+        # ape may retain Newick's surrounding single quotes in tip labels;
+        # Bio.Phylo and the trait workbook interpret these as delimiters.
+        raw_labels = [str(label) for label in tree.rx2("tip.label")]
+        tip_labels = [label[1:-1].replace("''", "'") if len(label) >= 2 and label[0] == label[-1] == "'" else label for label in raw_labels]
+        if len(tip_labels) != len(set(tip_labels)):
+            raise ValueError('Tree tip names are not unique after removing Newick quotes')
+        if tip_labels != raw_labels:
+            tree = robjects.r('function(tree, labels) { tree$tip.label <- labels; tree }')(
+                tree, robjects.StrVector(tip_labels)
+            )
         trait_data = self._filter_tree_tips(trait_data, tip_labels, "training")
         if trait_data.empty:
             raise ValueError(

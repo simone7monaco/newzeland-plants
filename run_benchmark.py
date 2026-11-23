@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import hashlib
 import shlex
 import subprocess
 import sys
@@ -48,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("n_seeds", type=int, help="Number of consecutive seeds to run")
     parser.add_argument("--start-seed", type=int, default=42, help="First seed (default: 42)")
+    parser.add_argument("--occlusion-protocol", choices=("paired", "individual"), default="paired", help="Shared target masking protocol for all models")
+    parser.add_argument("--include-unobserved-species", action="store_true", help="Retain species without observed target traits")
     parser.add_argument(
         "--output-dir", type=Path, default=Path("benchmark_results"),
         help="Benchmark run and aggregate output directory",
@@ -157,6 +160,23 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     gnn_args = shlex.split(args.gnn_args)
     baseline_args = shlex.split(args.baseline_args)
+    if any(arg == '--occlusion_protocol' or arg.startswith('--occlusion_protocol=') for arg in gnn_args + baseline_args):
+        raise SystemExit('Use --occlusion-protocol to set the same protocol for all models.')
+    marker = output_dir / 'occlusion_protocol.txt'
+    if marker.exists() and marker.read_text().strip() != args.occlusion_protocol:
+        raise SystemExit('The output directory contains a different occlusion protocol; choose a fresh directory.')
+    if not marker.exists() and runs_dir.exists() and any(runs_dir.iterdir()):
+        raise SystemExit('Existing benchmark runs have no occlusion protocol marker; choose a fresh output directory.')
+    marker.write_text(args.occlusion_protocol + '\n')
+    dataset_marker = output_dir / 'dataset_fingerprints.txt'
+    inputs = [Path('data/Ferns/FernMinMax_all.xlsx'), next(Path('data/Ferns').glob('*.nwk'))]
+    fingerprints = ''.join(f'{path.name} {hashlib.sha256(path.read_bytes()).hexdigest()}\n' for path in inputs)
+    fingerprints += f'include_unobserved_species {str(args.include_unobserved_species).lower()}\n'
+    if dataset_marker.exists() and dataset_marker.read_text() != fingerprints:
+        raise SystemExit('The workbook or phylogenetic tree differs from existing runs; choose a fresh output directory.')
+    if not dataset_marker.exists() and runs_dir.exists() and any(runs_dir.iterdir()):
+        raise SystemExit('Existing benchmark runs have no dataset fingerprints; choose a fresh output directory.')
+    dataset_marker.write_text(fingerprints)
     seeds = range(args.start_seed, args.start_seed + args.n_seeds)
     total_jobs = args.n_seeds * (1 + len(FEATURE_COMBINATIONS))
     LOGGER.info(
@@ -178,6 +198,8 @@ def main() -> None:
                 run([
                     "bash", "run_baselines.sh", *baseline_args,
                     "--baseline_models", ",".join(missing_baselines),
+                    "--occlusion_protocol", args.occlusion_protocol,
+                    "--include_unobserved_species", str(args.include_unobserved_species).lower(),
                     "--k", "-1", "--seed", str(seed),
                     "--output_dir", str(baseline_dir),
                 ], label=f"Missing baselines {', '.join(missing_baselines)} (seed {seed})")
@@ -203,6 +225,8 @@ def main() -> None:
                         sys.executable, "train.py", *gnn_args,
                         "--use_env_features", str(use_env).lower(),
                         "--use_phylo_features", str(use_phylo).lower(),
+                        "--occlusion_protocol", args.occlusion_protocol,
+                        "--include_unobserved_species", str(args.include_unobserved_species).lower(),
                         "--compute_xai", "true",
                         "--k", "-1", "--seed", str(seed), "--output_dir", str(gnn_dir),
                     ], label=f"GNN {combination_name} (seed {seed})")
