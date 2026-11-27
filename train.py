@@ -1,4 +1,8 @@
 import argparse
+import warnings
+# torch_geometric (<= 2.8.1) calls the deprecated torch.jit.script at import time; silence only that message.
+warnings.filterwarnings('ignore', message='`torch.jit.script` is deprecated', category=FutureWarning)
+import numpy as np
 from typing import cast
 import torch
 import torch.nn.functional as F
@@ -6,7 +10,7 @@ from torch_geometric.data import Data
 from loader import PlantDataset, NormalizeFeatures, data_split
 from models import TraitsPredictor, DeterministicLoss, MixedNLLLoss, MultiTargetDeterministicLoss, graph_smoothness_loss
 # from soft_delete.baselines_training import compute_correlation
-from tester import Tester, fit_conformal_residual_bounds, fit_conformal_residual_bounds_minmax
+from tester import Tester, fit_conformal_residual_bounds, fit_conformal_residual_bounds_minmax, project_ordered_bounds
 from tqdm import trange
 from pathlib import Path
 import pandas as pd
@@ -44,6 +48,9 @@ def resolve_checkpoint_path(load_checkpoint: str | Path | None, output_dir: Path
     if checkpoint_path.is_dir() or checkpoint_path.suffix == '':
         checkpoint_path = checkpoint_path / f'best_model_{fold}.pth'
     return checkpoint_path
+
+# Minimum observed cells per trait column left for fitting normalization.
+MIN_FIT_OBSERVATIONS = 10
 
 torch.set_float32_matmul_precision('medium')
 
@@ -96,6 +103,9 @@ def get_args():
     parser.add_argument('-e', '--epochs', type=int, default=1000, help='Number of epochs to train the model')
     parser.add_argument('--use_env_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use environmental features')
     parser.add_argument('--use_phylo_features', type=str2bool, nargs='?', const=True, default=True, help='Whether to use phylogenetic features')
+    parser.add_argument('--use_phylo_embeddings', type=str2bool, nargs='?', const=True, default=None, help='Use Node2Vec phylogenetic descriptors as species inputs (defaults to --use_phylo_features)')
+    parser.add_argument('--use_phylo_edges', type=str2bool, nargs='?', const=True, default=None, help='Use phylogenetic species-species edges for message passing; otherwise self-loops only (defaults to --use_phylo_features)')
+    parser.add_argument('--use_family', type=str2bool, nargs='?', const=True, default=True, help='Keep the categorical Family dummies among species inputs')
     parser.add_argument('--shuffle_phylo', type=str2bool, nargs='?', const=True, default=False, help='Whether to shuffle phylogenetic features (for ablation studies)')
     parser.add_argument('--output_dir', type=Path, default='results/', help='Directory to save results and models')
     parser.add_argument('--trait_representation', type=str, default='min_max_range', choices=['mean_std', 'min_max_range'], help='Trait representation to use (mean/std or min/max/range)')
@@ -113,7 +123,7 @@ def get_args():
     parser.add_argument('--trait_norm_range', type=str, default='yj', choices=['z', 'yj', 'logz'], help='Trait normalization mode for range features')
     parser.add_argument('--per_trait_loss', type=str2bool, nargs='?', const=True, default=True, help='Use per-trait loss reduction instead of flat entry-wise averaging')
     parser.add_argument('--k', type=int, default=-1, help='Fold index for cross-validation (0-4). Use -1 to perform a complete run over all folds sequentially.')
-    parser.add_argument('--split_strategy', type=str, default='random', choices=['random', 'stable', 'louvain'], help='Outer CV split: stable preserves species folds across dataset sizes')
+    parser.add_argument('--split_strategy', type=str, default='random', choices=['random', 'stable', 'louvain', 'genus', 'clade'], help='Outer CV split strategy')
     parser.add_argument('--seed', type=int, default=42, help='Random seed used for splitting and training')
 
     parser.add_argument('--lr', type=float, default=0.001, help='Learning rate for the optimizer')
@@ -130,6 +140,8 @@ def get_args():
     parser.add_argument('--smoothness_weight', type=float, default=0.0, help='Weight for the graph smoothness loss')
     parser.add_argument('--visible_loss_weight', type=float, default=0.2, help='Weight for the reconstruction loss on visible (non-masked) entries')
     parser.add_argument('--validation_mask_ratio', type=float, default=0.15, help='Fraction of observed outer-training cells held out for checkpoint selection')
+    parser.add_argument('--enforce_bounds_order', type=str2bool, nargs='?', const=True, default=True, help='Project reversed original-scale (min, max) predictions onto min <= max (midpoint) before calibration, metrics and saved outputs')
+    parser.add_argument('--order_penalty_weight', type=float, default=0.0, help='Weight of the soft hinge penalty relu(min - max) on original-scale predictions, divided by the training IQR of each trait (independent head only; 0 disables)')
     parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping (0 to disable)')
     parser.add_argument('--compute_xai', type=str2bool, nargs='?', const=True, default=True, help='Whether to compute XAI attributions during testing (can be slow)')
 
@@ -147,7 +159,32 @@ def get_args():
     parser.add_argument('--use_wb', type=str2bool, default=False, nargs='?', const=True, help='Use Weights & Biases for logging')
     parser.add_argument('--run_optuna', action='store_true', help='Run an Optuna sweep from a sweep YAML file')
     parser.add_argument('--optuna_sweep', type=str, default=None, help='Path to Optuna sweep YAML file (grid format)')
-    return parser.parse_args()
+    args = parser.parse_args()
+    resolve_component_flags(args)
+    return args
+
+
+def resolve_component_flags(args) -> None:
+    """Expand the legacy phylogeny switch into embedding and edge switches."""
+    if args.use_phylo_embeddings is None:
+        args.use_phylo_embeddings = args.use_phylo_features
+    if args.use_phylo_edges is None:
+        args.use_phylo_edges = args.use_phylo_features
+    args.use_phylo_features = bool(args.use_phylo_embeddings or args.use_phylo_edges)
+
+
+def drop_family_features(data: Data, prefix: str = 'Family_') -> Data:
+    """Remove the Family dummy columns from the species categorical inputs."""
+    names = list(getattr(data, 'genetic_feature_names', None) or [])
+    if len(names) != data.species_x_gen.size(1):
+        raise ValueError('Cannot identify Family columns: genetic_feature_names does not match species_x_gen.')
+    keep = [index for index, name in enumerate(names) if not name.startswith(prefix)]
+    if len(keep) == len(names):
+        raise ValueError(f'No {prefix}* columns found among categorical features: {names}')
+    data.species_x_gen = data.species_x_gen[:, keep]
+    data.genetic_feature_names = [names[index] for index in keep]
+    print(f'Dropped {len(names) - len(keep)} family columns; kept categorical inputs: {data.genetic_feature_names}')
+    return data
 
 
 def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float:
@@ -172,7 +209,7 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
         shared_bounds=args.shared_bounds_normalization or args.bounds_parameterization != 'independent',
     )
     data_path = Path(f'data/Ferns/')
-    trait_file = args.traits_filename or ('Traits.xlsx' if args.trait_representation == 'mean_std' else 'FernMinMax_all.xlsx')
+    trait_file = args.traits_filename or ('../.soft_del/Traits.xlsx' if args.trait_representation == 'mean_std' else 'FernTraits.xlsx')
     dataset = PlantDataset(
         data_path,
         transform=None,
@@ -183,7 +220,11 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
     )
     trait_names = dataset.trait_names
     occlusion_groups = trait_groups(trait_names, args.occlusion_protocol)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    dataset.tree_coverage().to_csv(args.output_dir / 'ftol_mapping.csv', index=False)
     raw_data = cast(Data, dataset[0])
+    if not args.use_family:
+        raw_data = drop_family_features(raw_data)
 
     if args.shuffle_phylo:
         print("Shuffling phylogenetic features for ablation study...")
@@ -197,8 +238,29 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
     # Fit preprocessing on outer-training species only; transform the complete
     # graph afterward so evaluation uses the same fold-specific scale.
     raw_train_data, _ = data_split(raw_data, k=args.k, seed=seed, split_strategy=args.split_strategy)
-    norm_transform.fit(raw_train_data)
+    # The inner-validation cells are chosen from the outer-training observations
+    # BEFORE fitting, and are excluded from the fit, so that checkpoint selection
+    # never uses preprocessing statistics computed on its own targets.
+    validation_mask = create_validation_mask(~raw_train_data.traits_nanmask, args.validation_mask_ratio, seed + args.k, occlusion_groups)
+    if not validation_mask.any():
+        raise ValueError('No observed cells are available for the inner validation mask.')
+    fit_data = raw_train_data.clone()
+    fit_data.traits_nanmask = fit_data.traits_nanmask | validation_mask
+    fit_counts = (~fit_data.traits_nanmask).sum(dim=0)
+    if (fit_counts < MIN_FIT_OBSERVATIONS).any():
+        sparse = {trait_names[i]: int(fit_counts[i]) for i in torch.where(fit_counts < MIN_FIT_OBSERVATIONS)[0].tolist()}
+        raise ValueError(f'Too few observations left to fit normalization after removing validation cells (min {MIN_FIT_OBSERVATIONS}): {sparse}')
+    norm_transform.fit(fit_data)
     data = norm_transform(raw_data.clone())
+
+    order_penalty_scale = None
+    if args.order_penalty_weight > 0:
+        if args.trait_representation != 'min_max_range' or args.bounds_parameterization != 'independent':
+            raise ValueError('--order_penalty_weight applies only to the independent min/max head.')
+        # Per-trait IQR of observed training maxima (validation cells excluded), in original units.
+        observed_max = fit_data.species_x_max.masked_fill(fit_data.traits_nanmask, float('nan')).numpy()
+        q75, q25 = np.nanpercentile(observed_max, 75, axis=0), np.nanpercentile(observed_max, 25, axis=0)
+        order_penalty_scale = torch.tensor(np.where(q75 - q25 > 0, q75 - q25, 1.0), dtype=torch.float32, device=device)
             
     trait_feature_keys = [f'species_x_{k}' for k in args.trait_representation.split('_')]
     if not args.keep_range_features:
@@ -211,14 +273,13 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
                             dropout=args.dropout, gnn_module=args.gnn_module, use_env_features=args.use_env_features,
                             use_phylo_features=args.use_phylo_features, mask_ratio=args.mask_ratio,
                             trait_feature_keys=trait_feature_keys, occlusion_groups=occlusion_groups,
-                            bounds_parameterization=args.bounds_parameterization)
+                            bounds_parameterization=args.bounds_parameterization,
+                            use_phylo_embeddings=args.use_phylo_embeddings,
+                            use_phylo_edges=args.use_phylo_edges)
 
     train_data, _ = data_split(data, k=args.k, seed=seed, split_strategy=args.split_strategy)
 
 
-    validation_mask = create_validation_mask(~train_data.traits_nanmask, args.validation_mask_ratio, seed + args.k, occlusion_groups)
-    if not validation_mask.any():
-        raise ValueError('No observed cells are available for the inner validation mask.')
     validation_targets = tuple(getattr(train_data, key).clone() for key in trait_feature_keys)
     train_data = mask_trait_inputs(train_data, validation_mask, trait_feature_keys)
     validation_data = train_data.clone()
@@ -297,6 +358,12 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
                     if args.trait_representation == 'mean_std'
                     else loss_fn(predictions, train_targets, observed_mask)
                 )
+
+            if order_penalty_scale is not None:
+                predicted_min = norm_transform.inverse_tensor('species_x_min', predictions[0])
+                predicted_max = norm_transform.inverse_tensor('species_x_max', predictions[1])
+                order_violation = F.relu(predicted_min - predicted_max) / order_penalty_scale
+                loss = loss + args.order_penalty_weight * order_violation.mean()
 
             # add graph smothness loss
             smoothness_prediction = predictions[0] if args.trait_representation == 'mean_std' else torch.cat(predictions, dim=1)
@@ -398,7 +465,10 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
     if args.trait_representation == 'mean_std':
         calibration_data.species_x_mean = calibration_predictions[0].cpu()
         calibration_data.species_x_std = calibration_predictions[1].cpu()
-        calibration_unnormalized = norm_transform.inverse(calibration_data, warn=False, soft_clip=True)
+        calibration_unnormalized = norm_transform.inverse(
+            calibration_data, warn=False, bounded=True, stage='calibration', trait_names=trait_names,
+            evaluation_mask=validation_mask.detach().cpu().numpy(),
+        )
         calibration_truth = norm_transform.inverse(calibration_truth_data, warn=False).species_x_mean
         conformal_calibration = fit_conformal_residual_bounds(
             calibration_unnormalized.species_x_mean,
@@ -412,7 +482,13 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
         calibration_data.species_x_max = calibration_predictions[1].cpu()
         if args.keep_range_features:
             calibration_data.species_x_range = calibration_predictions[2].cpu()
-        calibration_unnormalized = norm_transform.inverse(calibration_data, warn=False, soft_clip=True)
+        calibration_unnormalized = norm_transform.inverse(
+            calibration_data, warn=False, bounded=True, stage='calibration', trait_names=trait_names,
+            evaluation_mask=validation_mask.detach().cpu().numpy(),
+        )
+        if args.enforce_bounds_order:
+            calibration_unnormalized.species_x_min, calibration_unnormalized.species_x_max, _ = project_ordered_bounds(
+                calibration_unnormalized.species_x_min, calibration_unnormalized.species_x_max)
         calibration_truth = norm_transform.inverse(calibration_truth_data, warn=False)
         conformal_calibration = fit_conformal_residual_bounds_minmax(
             calibration_unnormalized.species_x_min,
@@ -441,6 +517,11 @@ def main(args, tester: Tester, trial: optuna.trial.Trial | None = None) -> float
                         gen_col_names=gen_col_names,
                         env_col_names=env_col_names,
                         conformal_calibration=conformal_calibration,
+                        enforce_bounds_order=args.enforce_bounds_order and args.trait_representation == 'min_max_range',
+                        original_truth=(
+                            {'min': raw_data.species_x_min, 'max': raw_data.species_x_max}
+                            if args.trait_representation == 'min_max_range' else None
+                        ),
                        )
     if args.use_wb:
         wandb.finish()
@@ -461,6 +542,12 @@ if __name__ == "__main__":
         exp_name += "phylo_"
     if not args.use_env_features and not args.use_phylo_features:
         exp_name += "base"
+    if args.use_phylo_features and not args.use_phylo_embeddings:
+        exp_name += "_no-phylo-emb"
+    if args.use_phylo_features and not args.use_phylo_edges:
+        exp_name += "_no-phylo-edges"
+    if not args.use_family:
+        exp_name += "_no-family"
     if args.trait_representation == 'mean_std':
         exp_name += f"_mean{args.trait_norm_mean}_std{args.trait_norm_std}"
     else:
@@ -475,6 +562,8 @@ if __name__ == "__main__":
     if args.include_unobserved_species:
         exp_name += '_include-unobserved'
     exp_name += f"_bounds-head-{args.bounds_parameterization}"
+    if args.order_penalty_weight > 0:
+        exp_name += f'_order-penalty-{args.order_penalty_weight:g}'
     if args.shared_bounds_normalization or args.bounds_parameterization != 'independent':
         exp_name += '_shared-bounds-norm'
     if exp_name.endswith('_'):
@@ -489,6 +578,8 @@ if __name__ == "__main__":
 |   ...
 |   Use Env Features: {args.use_env_features}
 |   Use Phylo Features: {args.use_phylo_features}
+|     Embeddings: {args.use_phylo_embeddings} | Species edges: {args.use_phylo_edges}
+|   Use Family: {args.use_family}
 |   
 """)
     tester = Tester(device)
@@ -565,20 +656,30 @@ if __name__ == "__main__":
             if args.use_env_features:
                 prediction_file_types += ['attributions_spatial']
 
+        # Wide prediction files are original-scale and indexed by species, exactly
+        # like the baselines' predictions_{min,max}_all.parquet.
+        wide_prediction_types = {f'predictions_{var_n}' for var_n in tester.trait_mode.split('_')}
+        if tester.trait_mode != 'mean_std':
+            prediction_file_types += ['predictions_long']
         for file_type in prediction_file_types:
             # Prefer Parquet; fall back to CSV if present for backward compatibility
             parts: list[pd.DataFrame] = []
-            for subdir in args.output_dir.glob('fold_*'):
+            for subdir in sorted(args.output_dir.glob('fold_*')):
                 parquet_path = subdir / f"{file_type}.parquet"
                 csv_path = subdir / f"{file_type}.csv"
                 if parquet_path.exists():
                     parts.append(pd.read_parquet(parquet_path))
                 elif csv_path.exists():
-                    parts.append(pd.read_csv(csv_path))
+                    parts.append(pd.read_csv(csv_path, index_col=0) if file_type in wide_prediction_types else pd.read_csv(csv_path))
             if not parts:
                 continue
-            df_cat = pd.concat(parts, ignore_index=True)
             out_path = args.output_dir / f"{file_type}_all.parquet"
-            df_cat.to_parquet(out_path, index=False)
+            if file_type in wide_prediction_types:
+                df_cat = pd.concat(parts)
+                df_cat.index.name = 'species'
+                df_cat.to_parquet(out_path)
+            else:
+                df_cat = pd.concat(parts, ignore_index=True)
+                df_cat.to_parquet(out_path, index=False)
             print(f"Saved concatenated {file_type} to {out_path}")
         tester.sanity_checks()

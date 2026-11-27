@@ -13,8 +13,10 @@ This bundle records what the paper describes, what the repository currently impl
 - [Study and data](methodology/study-and-data.md): task, data provenance and coverage.
 - [Graph and model](methodology/graph-and-model.md): graph construction, features and architecture.
 - [Training and masking](methodology/training-and-masking.md): objective, splits and transductive inference.
+- [Prediction safeguards](methodology/prediction-safeguards.md): shared bounded inversion, correction counts and stable error calculations.
 - [Experimental protocol](experiments/benchmark-protocol.md): configurations, baselines and execution.
 - [Metrics and aggregation](experiments/metrics-and-aggregation.md): evaluation, scales and summary statistics.
+- [Analysis conventions](experiments/analysis-conventions.md): canonical names, original-scale loading, common-species comparisons and consistency checks.
 - [Interpretation analyses](experiments/explainability-and-phylogeny.md): IG, error transitions and local analyses.
 - [Species and occlusion comparison](findings/species-occlusion-one-seed.md): one-seed factorial results and limits.
 - [Published benchmark findings](findings/benchmark.md): reported results, sources and limitations.

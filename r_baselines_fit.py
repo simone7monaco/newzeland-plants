@@ -1,19 +1,71 @@
+import os
+
+# One BLAS thread per process, set before numpy and R load OpenBLAS. The
+# benchmark runs several baseline processes in parallel, and mice's
+# remove.lindep calls eigen() for every variable and iteration: with threaded
+# OpenBLAS on a loaded machine one m=1, maxit=1 fit took 250 s instead of 7 s.
+# Export OPENBLAS_NUM_THREADS to override.
+os.environ.setdefault('OPENBLAS_NUM_THREADS', '1')
+
 import argparse
+from copy import deepcopy
 from typing import cast
 import warnings
+import yaml
 import numpy as np
 import torch
 from torch_geometric.data import Data
 from loader import PlantDataset, data_split
 from occlusion import trait_groups, group_for_trait
-from tester import compute_metrics_minmax
+from tester import compute_metrics_minmax, count_reversed_bounds, long_predictions_frame, project_ordered_bounds
 from pathlib import Path
 import pandas as pd
 import pytorch_lightning as pl
 from Bio import Phylo
 from sklearn.impute import SimpleImputer
 
-from r_models import MICE, MissForest, Rphylopars
+from r_models import MICE, MissForest, Rphylopars, pool_completions
+from analysis_utils import AnalysisConsistencyError, TREE_ONLY_MODELS
+from ml_baselines import ML_MODEL_NAMES, TunedTraitRegressor, build_ml_covariates, species_environment_summary
+from prediction_bounds import write_safeguard_log
+
+# Baselines that accept non-trait covariates (phylogenetic / environmental columns).
+COVARIATE_MODEL_NAMES = ('mice', 'missforest', *ML_MODEL_NAMES)
+
+
+def uses_covariates(model_name: str) -> bool:
+    return model_name.strip().lower() in COVARIATE_MODEL_NAMES
+
+
+def feature_configurations(args):
+    """Run trait-only methods once and supported covariate models in all four settings."""
+    if not args.all_feature_combinations:
+        yield deepcopy(args)
+        return
+    names = [name.strip() for name in args.baseline_models.split(',') if name.strip()]
+    combinations = [(False, False), (False, True), (True, False), (True, True)]
+    for use_env, use_phylo in combinations:
+        selected = names if not (use_env or use_phylo) else [name for name in names if uses_covariates(name)]
+        if selected:
+            local_args = deepcopy(args)
+            local_args.use_env_features, local_args.use_phylo_features = use_env, use_phylo
+            local_args.baseline_models = ','.join(selected)
+            yield local_args
+
+
+def model_dir_suffix(args, model_name: str) -> str:
+    """Directory suffix naming only the inputs that this baseline actually uses."""
+    suffix = f"_prot{args.training_protocol}_occlusion-{args.occlusion_protocol}"
+    if args.include_unobserved_species:
+        suffix += '_include-unobserved'
+    if uses_covariates(model_name):
+        if args.use_env_features:
+            suffix += '_env'
+        if args.use_phylo_features:
+            suffix += '_phylo'
+    if model_name.strip().lower() in ML_MODEL_NAMES and not args.use_categorical_features:
+        suffix += '_nocat'
+    return suffix
 
 
 class TrainingStatisticImputer:
@@ -134,35 +186,49 @@ def mask_trait_inputs(data: Data, mask: torch.Tensor, trait_feature_keys: list[s
 def get_args():
     parser = argparse.ArgumentParser(description='Fit min/max trait imputation baselines')
     parser.add_argument('--output_dir', type=Path, default=Path('results/'), help='Directory to save results and models')
-    parser.add_argument('--use_env_features', type=str2bool, nargs='?', const=True, default=False, help='Whether to use environmental features')
-    parser.add_argument('--use_phylo_features', type=str2bool, nargs='?', const=True, default=False, help='Whether to use phylogenetic features')    
+    parser.add_argument('--use_env_features', type=str2bool, nargs='?', const=True, default=False, help='Use species-level environmental summaries (occurrence-weighted mean/SD of location covariates) as extra columns for MICE, MissForest and the ML baselines')
+    parser.add_argument('--use_phylo_features', type=str2bool, nargs='?', const=True, default=False, help='Whether to use phylogenetic (Node2Vec) features (MICE, MissForest and ML baselines)')
+    parser.add_argument('--use_categorical_features', type=str2bool, nargs='?', const=True, default=True, help='ML baselines: include categorical attributes such as family, as in the GNN species input')
+    parser.add_argument('--all_feature_combinations', action='store_true', help='Run each supported baseline with neither input, phylogeny only, environment only and both; trait-only methods run once')
+    parser.add_argument('--ml_search_iter', type=int, default=30, help='ML baselines: random-search candidates per target trait')
+    parser.add_argument('--ml_inner_folds', type=int, default=5, help='ML baselines: inner species-level CV folds for tuning on outer-training species')
+    parser.add_argument('--fixed_hyperparameters', type=Path, default=None, help='YAML file with fixed ML parameters by model and trait')
+    parser.add_argument('--n_jobs', type=int, default=-1, help='ML baselines: parallel jobs for hyperparameter search')
     parser.add_argument('--invalid_bounds_policy', type=str, default='missing', choices=['missing', 'error', 'keep'], help='How to handle negative or inconsistent min/max/range records')
     parser.add_argument(
         '--baseline_models',
         type=str,
-        default='training_mean,training_median,phylo_nn,phylo_knn,rphylopars_bm,mice',
+        default='training_mean,training_median,phylo_nn,phylo_knn,rphylopars_bm,mice,random_forest,xgboost,mlp',
         help=(
             'Comma-separated list of baseline models to run '
             '(options: training_mean, training_median, phylo_nn, phylo_knn, '
-            'missforest, mice, rphylopars_bm). The Rphylopars '
+            'missforest, mice, rphylopars_bm, random_forest, xgboost, mlp). The Rphylopars '
             'baseline uses BM with a diagonal phylogenetic covariance for '
-            'numerical stability.'
+            'numerical stability. random_forest, xgboost and mlp are tuned '
+            'non-graph regressors whose inputs are selected with '
+            '--use_env_features, --use_phylo_features and --use_categorical_features.'
         ),
     )
     parser.add_argument('--k', type=int, default=-1, help='Fold index for cross-validation (0-4). Use -1 to perform a complete run over all folds sequentially.')
-    parser.add_argument('--split_strategy', type=str, default='random', choices=['random', 'stable', 'louvain'], help='Outer CV split: stable preserves species folds across dataset sizes')
-    parser.add_argument('--traits_filename', default='FernMinMax_all.xlsx', help='Trait workbook name within data/Ferns')
+    parser.add_argument('--split_strategy', type=str, default='random', choices=['random', 'stable', 'louvain', 'genus', 'clade'], help='Outer CV split strategy')
+    parser.add_argument('--traits_filename', default='FernTraits.xlsx', help='Trait workbook name within data/Ferns')
     parser.add_argument('--include_unobserved_species', type=str2bool, nargs='?', const=True, default=False, help='Retain species with no observed target traits for exploratory inference')
     parser.add_argument('--seed', type=int, default=42, help='Random seed used for splitting and model fitting')
+    parser.add_argument('--enforce_bounds_order', type=str2bool, nargs='?', const=True, default=True, help='Replace reversed (min, max) predictions by their midpoint before scoring and saving; reversed pairs are always counted first')
     parser.add_argument('--occlusion_protocol', choices=['paired', 'individual'], default='paired', help='Mask fertile/sterile pairs jointly or reproduce individual-trait occlusion')
     parser.add_argument('--validation_mask_ratio', type=float, default=0.15, help='Fraction of observed outer-training cells held out for inner-validation metrics')
     parser.add_argument('--training_protocol', type=int, default=1, choices=[1, 2], help='Training protocol: 1 = fit on outer-training species only; 2 = fit on outer-training + inner-validation species (transductive)') 
     return parser.parse_args()
 
 
-def build_baseline_model(name: str, categorical_columns: list[str], seed_value: int):
+def build_baseline_model(name: str, categorical_columns: list[str], seed_value: int,
+                         ml_options: dict | None = None):
     """Instantiate a baseline imputer by name."""
     name = name.strip().lower()
+    if name in ML_MODEL_NAMES:
+        if ml_options is None:
+            raise ValueError(f"ML baseline '{name}' requires ml_options")
+        return TunedTraitRegressor(name, seed=seed_value, **ml_options)
     if name == 'missforest':
         return MissForest(categorical_columns=categorical_columns, seed=seed_value)
     if name == 'mice':
@@ -209,7 +275,9 @@ def evaluate_and_save(imputed_df: pd.DataFrame, test_data: Data, trait_names: li
                        trait_col_names: dict[str, list[str]], variable_names: list[str],
                        save_dir: Path,
                        evaluation_species: list[str] | None = None,
-                       parameter_count: float | None = None) -> pd.DataFrame:
+                       parameter_count: float | None = None,
+                       enforce_bounds_order: bool = True,
+                       model_name: str | None = None) -> pd.DataFrame:
     """Score the imputed test-species entries against ground truth and persist CSV outputs."""
     save_dir.mkdir(parents=True, exist_ok=True)
     all_test_species = list(test_data.species_names)
@@ -225,9 +293,24 @@ def evaluate_and_save(imputed_df: pd.DataFrame, test_data: Data, trait_names: li
         )
         for variable in variable_names
     }
-    # Phylogeny-only methods cannot predict species absent from the tree.
-    # Preserve their rows as NaN and score only available prediction pairs.
-    eval_mask = eval_mask & torch.isfinite(predictions['min']) & torch.isfinite(predictions['max'])
+    # Phylogeny-only methods cannot predict species absent from the tree:
+    # their rows stay NaN and only available prediction pairs are scored.
+    # Any other non-finite prediction on an observed cell is an error, raised
+    # here (per fold) rather than silently dropped from the evaluation.
+    finite = torch.isfinite(predictions['min']) & torch.isfinite(predictions['max'])
+    infinite = torch.isinf(predictions['min']) | torch.isinf(predictions['max'])
+    missing = eval_mask & ~finite
+    if (eval_mask & infinite).any() or (missing.any() and model_name not in TREE_ONLY_MODELS):
+        rows, cols = torch.nonzero(missing, as_tuple=True)
+        examples = [(test_species[r], trait_names[c]) for r, c in zip(rows[:5].tolist(), cols[:5].tolist())]
+        raise AnalysisConsistencyError(
+            f'{model_name or "baseline"} {save_dir}: {int(missing.sum())} observed test cells have non-finite predictions, e.g. {examples}'
+        )
+    eval_mask = eval_mask & finite
+    # Count reversed pairs on the raw predictions, then (optionally) project them.
+    bounds_order = count_reversed_bounds(predictions['min'], predictions['max'], eval_mask, trait_names, enforce_bounds_order)
+    if enforce_bounds_order:
+        predictions['min'], predictions['max'], _ = project_ordered_bounds(predictions['min'], predictions['max'])
     truths = {
         variable: getattr(test_data, f'species_x_{variable}')[positions]
         for variable in variable_names
@@ -240,6 +323,10 @@ def evaluate_and_save(imputed_df: pd.DataFrame, test_data: Data, trait_names: li
     )
 
     metrics.to_csv(save_dir / 'per_trait_metrics.csv', index=False)
+    bounds_order.to_csv(save_dir / 'bounds_order.csv', index=False)
+    action = 'set to their midpoint' if enforce_bounds_order else 'left unchanged (projection disabled)'
+    print(f"Bounds order: {int(bounds_order.n_reversed.sum())} of {int(bounds_order.n_pairs.sum())} test (min, max) pairs reversed "
+          f"({int(bounds_order.n_eval_reversed.sum())} among evaluated cells); {action}.")
     if parameter_count is not None:
         # For AIC-style diagnostics only; see MICE.estimate_parameter_count for how this is derived.
         pd.DataFrame({'k_parameters': [parameter_count]}).to_csv(save_dir / 'model_complexity.csv', index=False)
@@ -247,6 +334,10 @@ def evaluate_and_save(imputed_df: pd.DataFrame, test_data: Data, trait_names: li
         pd.DataFrame(predictions[variable].numpy(), index=test_species, columns=trait_names).to_csv(
             save_dir / f'predictions_{variable}.csv'
         )
+    long_predictions_frame(
+        test_species, save_dir.name, trait_names, predictions, truths,
+        eval_mask, ~test_data.traits_nanmask[positions],
+    ).to_csv(save_dir / 'predictions_long.csv', index=False)
     print(metrics.to_string(index=False, float_format='%.4f'))
     return metrics
 
@@ -254,9 +345,13 @@ def evaluate_and_save(imputed_df: pd.DataFrame, test_data: Data, trait_names: li
 def main(args) -> None:
     print(f"---------------\nFitting baselines with args: {args}")
 
-    if args.use_env_features:
-        warnings.warn("Environmental features are not used by the baseline models. The --use_env_features flag will be ignored.", UserWarning)
-        exit(1)
+    baseline_model_names = [name.strip() for name in args.baseline_models.split(',') if name.strip()]
+    ml_requested = [name for name in baseline_model_names if name.lower() in ML_MODEL_NAMES]
+    if ml_requested and args.training_protocol != 1:
+        raise SystemExit(
+            f"ML baselines {ml_requested} are supervised per-trait regressors fitted on "
+            "outer-training species; use --training_protocol 1."
+        )
 
     data_path = Path('data/Ferns/')
     dataset = PlantDataset(
@@ -296,20 +391,68 @@ def main(args) -> None:
                                 columns=[f'phylo_{i}' for i in range(data.species_x_phylo.shape[1])])
         full_df = pd.merge(full_df, phylo_df, left_index=True, right_index=True, how='left')
 
+    if args.use_env_features:
+        # Same species-level summaries as the ML baselines (occurrence-weighted
+        # mean/SD of location covariates); MICE and missForest treat them as
+        # additional columns, imputing them where a species has no occurrences.
+        env_df = species_environment_summary(data)
+        full_df = pd.merge(full_df, env_df, left_index=True, right_index=True, how='left')
+
     train_df = full_df.loc[train_data.species_names]
     test_df = full_df.loc[test_data.species_names]
 
-    tree_path = next(data_path.glob('*.nwk'))
+    ml_train_df = ml_test_df = None
+    ml_options = None
+    if ml_requested:
+        # Species-level inputs only: no fitted statistic is computed here; all
+        # scaling, imputation and tuning happen on outer-training species.
+        ml_covariates = build_ml_covariates(
+            data,
+            use_categorical=args.use_categorical_features,
+            use_phylo=args.use_phylo_features,
+            use_env=args.use_env_features,
+        )
+        ml_df = pd.concat([full_trait_df.loc[:, trait_columns], ml_covariates.loc[full_trait_df.index]], axis=1)
+        ml_train_df = ml_df.loc[train_data.species_names]
+        ml_test_df = ml_df.loc[test_data.species_names]
+        fixed_by_model = None
+        if args.fixed_hyperparameters:
+            with args.fixed_hyperparameters.open() as handle:
+                fixed_by_model = yaml.safe_load(handle)['models']
+            for model_name in baseline_model_names:
+                if model_name in ML_MODEL_NAMES and model_name not in fixed_by_model:
+                    raise ValueError(f'Missing fixed parameters for {model_name}')
+        ml_options = dict(
+            trait_names=trait_names,
+            trait_col_names=trait_col_names,
+            occlusion_groups=occlusion_groups,
+            n_iter=args.ml_search_iter,
+            inner_folds=args.ml_inner_folds,
+            n_jobs=args.n_jobs,
+        )
+        print(f"ML baseline inputs: {len(trait_columns)} trait columns + {ml_covariates.shape[1]} covariates")
+
+    # Keep tree-based baselines aligned with the FTOL tree reconstructed by
+    # PlantDataset; the repository no longer requires a hand-supplied .nwk file.
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    tree_path = args.output_dir / f"ftol_tree_{dataset.tree_fingerprint}.nwk"
+    if not tree_path.exists():
+        tree_path.write_text(dataset.tree_newick.rstrip() + '\n')
+    dataset.tree_coverage().to_csv(args.output_dir / 'ftol_mapping.csv', index=False)
     tree = Phylo.read(tree_path, 'newick')
     tree_tips = {str(tip.name) for tip in tree.get_terminals()}
 
-    baseline_model_names = [name.strip() for name in args.baseline_models.split(',') if name.strip()]
-
     for model_name in baseline_model_names:
         print(f"\n=== Fitting baseline '{model_name}' (fold {args.k}) ===")
-        model = build_baseline_model(model_name, categorical_columns, args.seed + args.k)
+        model_options = dict(ml_options) if ml_options is not None else None
+        if model_name in ML_MODEL_NAMES and fixed_by_model is not None:
+            model_options['fixed_params'] = fixed_by_model[model_name]
+        model = build_baseline_model(model_name, categorical_columns, args.seed + args.k, model_options)
         model_train_df = train_df
         model_test_df = test_df
+        if isinstance(model, TunedTraitRegressor):
+            model_train_df = ml_train_df
+            model_test_df = ml_test_df
         evaluation_species = list(test_data.species_names)
         if isinstance(model, (Rphylopars, PhylogeneticKNNImputer)):
             missing_train = sorted(set(train_df.index).difference(tree_tips))
@@ -354,6 +497,10 @@ def main(args) -> None:
                 model.fit(model_train_df.loc[:, trait_columns], tree_path)
             elif isinstance(model, TrainingStatisticImputer):
                 model.fit(model_train_df.loc[:, trait_columns])
+            elif isinstance(model, TunedTraitRegressor):
+                # One tuned regressor per target trait; its occlusion group is
+                # excluded from the inputs, matching the test-time masking.
+                model.fit(model_train_df)
             else:
                 raise ValueError(f"Unknown model type: {type(model)}")
 
@@ -362,11 +509,16 @@ def main(args) -> None:
                 columns_to_mask = [trait_col_names[variable][idx] for variable in variable_names for idx in group_for_trait(occlusion_groups, j)]
                 masked_test_df = model_test_df.copy(deep=True)
                 masked_test_df.loc[:, columns_to_mask] = np.nan
-                if not isinstance(model, MICE):
+                if not isinstance(model, (MICE, TunedTraitRegressor)):
                     masked_test_df = masked_test_df.loc[:, trait_columns]
 
-                if isinstance(model, MICE):
-                    imputed_df = model.transform(masked_test_df)[0]
+                if isinstance(model, TunedTraitRegressor):
+                    observed = pd.Series(
+                        (~test_data.traits_nanmask[:, j]).numpy(), index=test_data.species_names,
+                    ).loc[masked_test_df.index].to_numpy()
+                    imputed_df = model.transform(masked_test_df, j, evaluation_mask=observed)
+                elif isinstance(model, MICE):
+                    imputed_df = pool_completions(model.transform(masked_test_df))
                 else:
                     imputed_df = model.transform(masked_test_df)
                 imputed_df_all.loc[imputed_df.index, columns_to_impute] = imputed_df.loc[:, columns_to_impute].to_numpy()
@@ -381,7 +533,7 @@ def main(args) -> None:
                 if isinstance(model, MissForest):
                     imputed_df = model.fit_transform(masked_df)
                 elif isinstance(model, MICE):
-                    imputed_df = model.fit_transform(masked_df)[0]
+                    imputed_df = pool_completions(model.fit_transform(masked_df))
                     model_parameter_counts.append(model.estimate_parameter_count())
                 elif isinstance(model, Rphylopars):
                     imputed_df = model.fit_transform(masked_df.loc[:, trait_columns], tree_path)
@@ -394,10 +546,14 @@ def main(args) -> None:
 
                 imputed_df_all.loc[model_test_df.index, columns_to_impute] = imputed_df.loc[model_test_df.index, columns_to_impute].to_numpy()
 
-        save_dir = args.output_dir / f"{model_name.upper()}{args.model_dir_suffix}" / f'fold_{args.k}'
+        save_dir = args.output_dir / f"{model_name.upper()}{model_dir_suffix(args, model_name)}" / f'fold_{args.k}'
         evaluate_and_save(imputed_df_all, test_data, trait_names, trait_col_names, variable_names,
                            save_dir, evaluation_species,
-                           parameter_count=float(np.mean(model_parameter_counts)) if model_parameter_counts else None)
+                           parameter_count=float(np.mean(model_parameter_counts)) if model_parameter_counts else None,
+                           enforce_bounds_order=args.enforce_bounds_order, model_name=model_name)
+        if isinstance(model, TunedTraitRegressor):
+            pd.DataFrame(model.tuning_records).to_csv(save_dir / 'tuning.csv', index=False)
+            write_safeguard_log(model.prediction_diagnostics, save_dir / 'prediction_safeguards.csv')
 
 
 """
@@ -409,11 +565,24 @@ For each variable j, fit_transform(train + test_j_masked)
 """
 
 
-if __name__ == "__main__":
-    args = get_args()
+def run_configuration(args):
     seed = args.seed
     pl.seed_everything(seed)
     baseline_model_names = [name.strip() for name in args.baseline_models.split(',') if name.strip()]
+    if args.use_env_features or args.use_phylo_features:
+        # Trait-only baselines cannot use these inputs: skip them entirely so no
+        # output directory suggests results with env/phylo information.
+        skipped = [name for name in baseline_model_names if not uses_covariates(name)]
+        if skipped:
+            warnings.warn(
+                f"Skipping {skipped}: they use trait values (and the tree) only, so "
+                "--use_env_features/--use_phylo_features do not apply. Run them without these flags.",
+                UserWarning,
+            )
+        baseline_model_names = [name for name in baseline_model_names if uses_covariates(name)]
+        args.baseline_models = ','.join(baseline_model_names)
+        if not baseline_model_names:
+            raise SystemExit('No requested baseline uses environmental or phylogenetic features.')
     baseline_model_list = "\n- " + "\n- ".join(baseline_model_names) if baseline_model_names else "No baseline models specified"
 
     print(f"""
@@ -423,13 +592,6 @@ if __name__ == "__main__":
 |
 """)
 
-    args.model_dir_suffix = f"_prot{args.training_protocol}_occlusion-{args.occlusion_protocol}"
-    if args.include_unobserved_species:
-        args.model_dir_suffix += '_include-unobserved'
-    if args.use_env_features:
-        args.model_dir_suffix += "_env"
-    if args.use_phylo_features:
-        args.model_dir_suffix += "_phylo"
 
     if args.k != -1:
         print(f"Running fold {args.k + 1}/5")
@@ -443,7 +605,7 @@ if __name__ == "__main__":
         variable_names = ['min', 'max']
 
         for model_name in baseline_model_names:
-            model_dir = args.output_dir / f"{model_name.upper()}{args.model_dir_suffix}"
+            model_dir = args.output_dir / f"{model_name.upper()}{model_dir_suffix(args, model_name)}"
             fold_dirs = sorted(model_dir.glob('fold_*'))
 
             parts: list[pd.DataFrame] = []
@@ -457,6 +619,21 @@ if __name__ == "__main__":
             if parts:
                 metrics_all = pd.concat(parts, ignore_index=True)
                 metrics_all.to_parquet(model_dir / 'per_trait_metrics_all.parquet', index=False)
+
+            order_parts = [pd.read_csv(d / 'bounds_order.csv').assign(fold=d.name) for d in fold_dirs if (d / 'bounds_order.csv').exists()]
+            if order_parts:
+                order_all = pd.concat(order_parts, ignore_index=True).groupby('trait', sort=False).agg(
+                    n_pairs=('n_pairs', 'sum'), n_reversed=('n_reversed', 'sum'),
+                    n_eval_pairs=('n_eval_pairs', 'sum'), n_eval_reversed=('n_eval_reversed', 'sum'),
+                    max_reversal=('max_reversal', 'max'), projected=('projected', 'all'),
+                ).reset_index()
+                order_all['pct_reversed'] = 100 * order_all.n_reversed / order_all.n_pairs.clip(lower=1)
+                order_all.to_csv(model_dir / 'bounds_order_all_folds.csv', index=False)
+                print(f"Bounds order for '{model_name}': {int(order_all.n_reversed.sum())}/{int(order_all.n_pairs.sum())} test pairs had min > max before projection.")
+
+            long_parts = [pd.read_csv(d / 'predictions_long.csv') for d in fold_dirs if (d / 'predictions_long.csv').exists()]
+            if long_parts:
+                pd.concat(long_parts, ignore_index=True).to_parquet(model_dir / 'predictions_long_all.parquet', index=False)
 
             for variable in variable_names:
                 pred_parts: list[pd.DataFrame] = []
@@ -474,3 +651,9 @@ if __name__ == "__main__":
                 preds_all.to_parquet(model_dir / f'predictions_{variable}_all.parquet')
 
             print(f"Saved merged results for '{model_name}' to {model_dir}/")
+
+
+if __name__ == "__main__":
+    args = get_args()
+    for configuration in feature_configurations(args):
+        run_configuration(configuration)

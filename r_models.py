@@ -38,6 +38,28 @@ def _coerce_categorical_columns(
     return converted
 
 
+def pool_completions(completions: list[pd.DataFrame]) -> pd.DataFrame:
+    """Point prediction pooled over the ``m`` MICE completed datasets.
+
+    Numeric columns are averaged across completions (the Rubin's-rules point
+    estimate); non-numeric columns (categorical covariates, never scored) are
+    taken from the first completion. Scoring a single completion would evaluate
+    one random draw instead of the imputation model's point prediction.
+    """
+    if not completions:
+        raise ValueError("no completed datasets to pool")
+    first = completions[0]
+    for other in completions[1:]:
+        if not (other.index.equals(first.index) and other.columns.equals(first.columns)):
+            raise ValueError("completed datasets must share index and columns")
+    pooled = first.copy()
+    numeric = [c for c in first.columns if pd.api.types.is_numeric_dtype(first[c])]
+    if numeric:
+        stacked = np.stack([c.loc[:, numeric].to_numpy(dtype=np.float64) for c in completions])
+        pooled.loc[:, numeric] = stacked.mean(axis=0)
+    return pooled
+
+
 @dataclass
 class MICE:
     """Exact Python front-end to R's mice(..., method='cart').

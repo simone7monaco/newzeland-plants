@@ -6,15 +6,15 @@ tags: [species, provenance, recovery]
 status: draft
 generated: {by: codex/gpt-6}
 sources:
-  - {resource: ../../data/Ferns/FernMinMax.xlsx, title: Historical reduced trait workbook}
+  - {resource: ../../data/.soft_del/FernMinMax.xlsx, title: Historical reduced trait workbook}
   - {resource: ../../data/Ferns/FernMinMax_all.xlsx, title: Full source trait workbook}
 ---
 
 # Historical species coverage and recovery
 
-The old 170-taxon workbook and the 207-row source workbook remain intact. The 37 names below occur in the source workbook but not in the reduced workbook. All except `Hymenophyllum_falklandicum` meet the current default requirement of at least one observed target after cleaning. `Hymenophyllum_falklandicum` remains in the source workbook and can be restored as a graph node with `--include_unobserved_species true`; it has no observed target for scoring.
+The old 170-taxon workbook is archived under `data/.soft_del/`; the 207-row source workbook remains intact. The 37 names below occur in the source workbook but not in the reduced workbook. This describes historical membership only. `Hymenophyllum_falklandicum` remains in the source workbook and can be restored as a graph node with `--include_unobserved_species true`; it has no observed target for scoring.
 
-This record documents membership, not a verified reason for historical exclusion. The old workbook can be selected for historical reconstruction using `--traits_filename FernMinMax.xlsx` with the desired explicit masking setting. Historical benchmark results must not be mixed with future runs.
+This record documents historical membership, not a verified reason for historical exclusion. The old workbook can be selected for historical reconstruction using `--traits_filename ../.soft_del/FernMinMax.xlsx` with the desired explicit masking setting. Historical benchmark results must not be mixed with future runs.
 
 | Species or subspecies | Family |
 |---|---|

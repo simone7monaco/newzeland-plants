@@ -12,8 +12,8 @@ sources:
   - {resource: ../../models.py, title: Loss and masking}
   - {resource: ../../tester.py, title: Model evaluation}
   - {resource: ../../notebooks/02_ablation_analysis.ipynb, title: Aggregation notebook}
-  - {resource: ../../data/Ferns/FernMinMax.xlsx, title: Current workbook}
-  - {resource: ../../data/Ferns/grafted_tree.nwk, title: Current tree}
+  - {resource: ../../data/Ferns/FernTraits.xlsx, title: Current analytical workbook}
+  - {resource: ../../ftol_tree.R, title: FTOL tree reconstruction}
 ---
 
 # Manuscript and implementation consistency audit
@@ -22,7 +22,7 @@ Scope: discrepancies in the pre-existing paper, legacy experimental setup and sa
 
 ## Confirmed discrepancies
 
-1. **Sample size and tree coverage — methodological text aligned.** The workbook and species list contain 207 taxa; the standard analytical cohort now contains 206 after excluding the species without observed traits. Of these, 184 match tips in the supplied, potentially grafted tree and 22 do not. Earlier manuscript counts 208 and 174 did not match these artifacts and were removed from the methodological description. The original FTOL coverage and graft provenance remain unresolved. The historical 170-taxon benchmark is preserved and must not be presented as a result of the new 206-taxon protocol.
+1. **Sample size and tree coverage — historical analysis audit.** The complete source workbook and species list contain 207 taxa. The current analytical workbook contains 189 rows, all with recorded min/max traits; see [study and data](../methodology/study-and-data.md) for the eligibility rationale. Earlier manuscript counts 208 and 174 did not match the then-current artifacts and were removed from the methodological description. The original FTOL coverage and graft provenance remain unresolved. Historical benchmark cohorts must not be presented as results from this current workbook.
 2. **Aggregate terminology.** Results and Discussion describe 4.511 as the median across trait–variable slices. `02_ablation_analysis.ipynb` first takes the mean across slices within each seed, then the median across seeds. A different statistic—the median of the twelve Table 1 full-model entries—is about 1.535. The number 4.511 is not necessarily wrong; its stated aggregation is incomplete.
 3. **Training objective — methodological text aligned.** The earlier manuscript equation used a globally weighted sum divided by `2W`, whereas the current implementation computes separate masked and visible Huber means, by default first averaging per trait, and adds `masked + 0.2 × visible`. The manuscript equation now describes the current default. The exact historical run implementation must still be checked when interpreting its results.
 4. **Deterministic-seed wording.** The manuscript says deterministic methods produce the same cross-validation results across different splits. Deterministic fitting is repeatable for the same data and split, but training statistics and predictions can change when species folds change; the current code uses the seed to shuffle folds. The claim needs correction.
@@ -31,7 +31,7 @@ Scope: discrepancies in the pre-existing paper, legacy experimental setup and sa
 ## Material uncertainties and setting limitations
 
 - **Tree handling.** Methods now match the loader: taxa absent from the supplied tree have zero embeddings and no interspecies phylogenetic edges. The supplied tree may already contain grafted approximations. Trace tree creation and original FTOL naming before assigning source-FTOL coverage or approximation counts.
-- **Validation preprocessing.** Outer-test traits are excluded from fitted trait transforms, but normalization is fitted before selection of the internal validation cells. The internal validation mask is therefore not independent of all fitted preprocessing. All shared spatial nodes participate in fitting environmental normalization; no spatial holdout is performed.
+- **Validation preprocessing.** Resolved in code on 2026-11-24: the internal validation cells are chosen before normalization and excluded from its fit, so neither outer-test nor inner-validation traits enter the fitted trait transforms. Results produced before this date used the earlier order, in which validation cells contributed to the fit; a three-seed check showed no distinguishable effect (see the [log](../log.md)), but historical artifacts are not strictly identical. All shared spatial nodes participate in fitting environmental normalization; no spatial holdout is performed.
 - **Legacy duplicate traits.** In the historical one-trait-at-a-time evaluation, an identical fertile/sterile counterpart could remain visible. The current default and manuscript protocol use paired masking; historical outputs do not. Matched repeated-seed reruns are required.
 - **Attribution and tests.** Family remains in the no-phylogeny configuration, and the phylogeny switch jointly changes descriptors and species graph. Attributions are model sensitivity, while proportional errors can be unstable near zero. Local Moran multiplicity handling and the upstream creation of saved summaries were not established from plotting scripts.
 - **Preprocessing and coverage provenance.** The source records, units, outlier rules, cache creation and original per-run software/data versions are not sufficiently documented to independently reproduce all paper numbers. Output filenames and current defaults alone cannot prove which version produced historical artifacts.

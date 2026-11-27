@@ -1,3 +1,6 @@
+import warnings
+# torch_geometric (<= 2.8.1) calls the deprecated torch.jit.script at import time; silence only that message.
+warnings.filterwarnings('ignore', message='`torch.jit.script` is deprecated', category=FutureWarning)
 import torch
 import numpy as np
 from torch import dist, dtype, nn
@@ -64,7 +67,7 @@ class TraitsPredictor(nn.Module):
                  num_layers, dropout=0.3, gnn_module='GATConv', eps=1e-6, mask_ratio=0.15, 
                  mask_strategy='random', use_env_features=True, use_phylo_features=True,
                  trait_feature_keys=('species_x_min', 'species_x_max', 'species_x_range'), occlusion_groups=None,
-                 bounds_parameterization='independent'):
+                 bounds_parameterization='independent', use_phylo_embeddings=None, use_phylo_edges=None):
         super(TraitsPredictor, self).__init__()
 
         gnn = getattr(pyg_nn, gnn_module)
@@ -79,8 +82,13 @@ class TraitsPredictor(nn.Module):
         # if trait_representation == 'mean_std'
         # self.trait_feature_keys = ('species_x_mean', 'species_x_std')
 
+        # Component switches for ablations. The legacy use_phylo_features flag
+        # sets both phylogenetic components unless they are given explicitly.
+        self.use_phylo_embeddings = use_phylo_features if use_phylo_embeddings is None else use_phylo_embeddings
+        self.use_phylo_edges = use_phylo_features if use_phylo_edges is None else use_phylo_edges
+        use_phylo_features = self.use_phylo_embeddings or self.use_phylo_edges
         self.use_phylo_features = use_phylo_features
-        effective_phylo = in_phylo if use_phylo_features else 0
+        effective_phylo = in_phylo if self.use_phylo_embeddings else 0
 
         if use_env_features:
             pos_embedding_dim = 4 # sin-cos embeddings for latitude and longitude
@@ -99,7 +107,7 @@ class TraitsPredictor(nn.Module):
             num_layers=num_layers,
             gnn=gnn,
             dropout=dropout,
-            check_oversmoothing=use_phylo_features,
+            check_oversmoothing=self.use_phylo_edges,
         )
         
         self.fc = nn.Linear(hidden_channels, len(self.trait_feature_keys) * out_channels)
@@ -115,15 +123,14 @@ class TraitsPredictor(nn.Module):
         self.mask_ratio = mask_ratio  # Fraction of observed traits to mask during training
         self.mask_strategy = mask_strategy  # 'random', 'blockwise', or 'balanced'
         self.use_env_features = use_env_features
-        self.use_phylo_features = use_phylo_features
         self.space_attention_weights = None
         self.bip_attention_weights = None
         self.species_attention_weights = None
         self.reconstruction_mask = None
 
     def _species_graph_inputs(self, data, n_species_nodes):
-        """Return phylogenetic edges, or self-loops when phylogeny is disabled."""
-        if self.use_phylo_features:
+        """Return phylogenetic edges, or self-loops when species edges are disabled."""
+        if self.use_phylo_edges:
             return data.species_species_edge_index, data.species_species_edge_attr
 
         nodes = torch.arange(n_species_nodes, device=data.species_x_gen.device)
@@ -196,7 +203,7 @@ class TraitsPredictor(nn.Module):
         else:
             visibility_mask = observed_mask.float()
         
-        phylo_feats = [data.species_x_phylo] if self.use_phylo_features else []
+        phylo_feats = [data.species_x_phylo] if self.use_phylo_embeddings else []
         species_input = torch.cat(species_traits + [visibility_mask, data.species_x_gen] + phylo_feats, dim=1)
         species_input = self.species_linear(species_input).relu()
         

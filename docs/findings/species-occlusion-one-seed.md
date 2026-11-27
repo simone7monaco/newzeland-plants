@@ -19,7 +19,7 @@ sources:
 
 ## Design and limitations
 
-This historical run used a 207-node complete graph, including one taxon without observed traits. The current default excludes that node, so these results are not a rerun of the 206-taxon protocol.
+This historical run used a 207-node complete graph, including one taxon without observed traits. The current standard analytical workbook contains 189 taxa, so these results are not a rerun of the current protocol.
 
 Seed 42, five species folds and 1,000 epochs were used for four conditions: 170 vs 207 available taxa, crossed with individual vs jointly paired fertile/sterile masking. The full graph model had both phylogeny and environment enabled; existing baseline models were also evaluated. All 170 common taxa had the same fold in all conditions, verified against the stable species hash. The GNN comparison below uses the intersection of finite evaluated predictions across all four conditions for each output and normalizes RMSE by the original 170-species workbook's IQR. Thus an output's `n` is held constant across conditions. Lower NRMSE-IQR is better; the aggregate is a simple mean of the twelve output scores, not a pooled RMSE.
 

@@ -1,3 +1,6 @@
+import warnings
+# torch_geometric (<= 2.8.1) calls the deprecated torch.jit.script at import time; silence only that message.
+warnings.filterwarnings('ignore', message='`torch.jit.script` is deprecated', category=FutureWarning)
 import sys
 from typing import cast
 import warnings
@@ -9,6 +12,7 @@ import itertools
 import pandas as pd
 import re
 import hashlib
+import io
 from Bio import Phylo
 import networkx as nx
 
@@ -28,6 +32,8 @@ import torch
 from torch_geometric.transforms import KNNGraph, BaseTransform
 from torch_geometric.data import Data, HeteroData, InMemoryDataset
 from torch_geometric.utils import from_networkx, subgraph, bipartite_subgraph
+
+from prediction_bounds import DEFAULT_EXTRAPOLATION_MARGIN, bounded_inverse
 
 FEATURE_CACHE_VERSION = 3
 PROCESSED_DATA_VERSION = 9
@@ -91,12 +97,14 @@ class NormalizeFeatures(BaseTransform):
             'spatial_species_edge_attr': 'z',
         }
         self.props = {}
+        self.prediction_diagnostics = []
         self.trait_attributes = {
             'species_x_mean', 'species_x_std', 'species_x_min',
             'species_x_max', 'species_x_range',
         }
 
     def fit(self, data: Data, eps: float = 1e-6):
+        self.prediction_diagnostics.clear()
         if getattr(data, 'props', False):
             print("Warning: Data already has props, overwriting\n")
 
@@ -175,6 +183,71 @@ class NormalizeFeatures(BaseTransform):
             self.props['species_x_max'] = {
                 name: value.clone() for name, value in self.props['species_x_min'].items()
             }
+        self._eps = eps
+        self._fit_prediction_ranges(data)
+
+    # Trait outputs that are mapped back to the original scale with the shared
+    # bounded-extrapolation rule (prediction_bounds.bounded_inverse).
+    BOUNDED_TRAIT_KEYS = ('species_x_mean', 'species_x_min', 'species_x_max', 'species_x_range')
+
+    def _normalize_values(self, k_norm: str, values: np.ndarray) -> np.ndarray:
+        """Original -> normalized scale for a (n, k) array (same maps as forward())."""
+        mode, props = self.normalizations[k_norm], self.props[k_norm]
+        mean, std = props['mean'].double().numpy(), props['std'].double().numpy()
+        values = np.asarray(values, dtype=np.float64)
+        if mode == 'yj':
+            lambdas = props['lambdas'].numpy()
+            values = np.column_stack([_yj_transform(values[:, j], lambdas[j]) for j in range(values.shape[1])])
+        elif mode == 'logz':
+            with np.errstate(divide='ignore', invalid='ignore'):
+                values = np.log(values + getattr(self, '_eps', 1e-6))
+        elif mode != 'z':
+            raise ValueError(f'No trait inverse for normalization {mode!r}.')
+        return (values - mean) / std
+
+    def _denormalize_values(self, k_norm: str, values: np.ndarray) -> np.ndarray:
+        """Normalized -> original scale for a (n, k) array, without any bounding."""
+        mode, props = self.normalizations[k_norm], self.props[k_norm]
+        y = np.asarray(values, dtype=np.float64) * props['std'].double().numpy() + props['mean'].double().numpy()
+        if mode == 'yj':
+            lambdas = props['lambdas'].numpy()
+            return np.column_stack([_yj_inverse(y[:, j], lambdas[j]) for j in range(y.shape[1])])
+        if mode == 'logz':
+            with np.errstate(over='ignore'):
+                return np.exp(y) - 1e-6
+        if mode == 'z':
+            return y
+        raise ValueError(f'No trait inverse for normalization {mode!r}.')
+
+    def _fit_prediction_ranges(self, data: Data) -> None:
+        """Store, per trait output, the normalized range of the fitted (observed)
+        values and whether they were all nonnegative. These parameterize the
+        bounded inverse shared with the ML baselines."""
+        for k_norm in self.BOUNDED_TRAIT_KEYS:
+            if k_norm not in data or k_norm not in self.props or self.normalizations[k_norm] not in ('yj', 'z', 'logz'):
+                continue
+            values = data[k_norm].double().cpu().numpy()
+            if values.ndim == 1:
+                values = values[:, None]
+            observed = (~data.traits_nanmask.cpu().numpy()) if hasattr(data, 'traits_nanmask') else np.ones(values.shape, dtype=bool)
+            observed = observed & np.isfinite(values)
+            normalized = np.where(observed, self._normalize_values(k_norm, np.where(observed, values, 0.0)), np.nan)
+            has_obs = observed.any(axis=0)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                low = np.where(has_obs, np.nanmin(normalized, axis=0), 0.0)
+                high = np.where(has_obs, np.nanmax(normalized, axis=0), 0.0)
+            self.props[k_norm]['observed_min'] = torch.tensor(low, dtype=torch.float64)
+            self.props[k_norm]['observed_max'] = torch.tensor(high, dtype=torch.float64)
+            self.props[k_norm]['nonnegative'] = torch.tensor((np.where(observed, values, 0.0) >= 0).all(axis=0))
+        if self.shared_bounds and all('observed_min' in self.props.get(k, {}) for k in ('species_x_min', 'species_x_max')):
+            # min and max share one monotone map; clipping both to the union of
+            # their ranges keeps that map (and therefore their order) identical.
+            pmin, pmax = self.props['species_x_min'], self.props['species_x_max']
+            low = torch.minimum(pmin['observed_min'], pmax['observed_min'])
+            high = torch.maximum(pmin['observed_max'], pmax['observed_max'])
+            for props in (pmin, pmax):
+                props['observed_min'], props['observed_max'] = low.clone(), high.clone()
             
     def transform(self, data: Data, eps: float = 1e-6) -> Data:
         return self.forward(data, eps)
@@ -221,7 +294,58 @@ class NormalizeFeatures(BaseTransform):
                 data[k_norm] = data[k_norm] * ~data.traits_nanmask
         return data
     
-    def inverse(self, data, warn=True, soft_clip=False, soft_clip_lower=0.0):
+    def inverse_tensor(self, key: str, values: torch.Tensor, clamp: float = 6.0,
+                       margin: float = DEFAULT_EXTRAPOLATION_MARGIN) -> torch.Tensor:
+        """Differentiable inverse of a fitted trait transform (yj, z, logz).
+
+        Normalized inputs are clamped to the fitted observed range extended by
+        ``margin`` SDs (the same window as ``inverse(bounded=True)`` and the ML
+        baselines); without a fitted range, to +-clamp SDs. Power bases are also
+        kept inside the Yeo-Johnson inverse domain, so outputs stay finite.
+        """
+        if torch.isinf(values).any():
+            raise FloatingPointError('raw predictions contain infinity; refusing to clip invalid model outputs')
+        mode = self.normalizations[key]
+        props = self.props[key]
+        mean, std = props['mean'].to(values.device), props['std'].to(values.device)
+        if 'observed_min' in props:
+            low = (props['observed_min'] - margin).to(device=values.device, dtype=values.dtype)
+            high = (props['observed_max'] + margin).to(device=values.device, dtype=values.dtype)
+            y = torch.maximum(torch.minimum(values, high), low) * std + mean
+        else:
+            y = values.clamp(-clamp, clamp) * std + mean
+        if mode == 'z':
+            return y
+        if mode == 'logz':
+            return torch.exp(y) - 1e-6
+        if mode != 'yj':
+            raise ValueError(f'No differentiable inverse for normalization {mode!r}.')
+        lam = props['lambdas'].to(values.device).expand_as(y)
+        pos = y >= 0
+        near0, near2 = lam.abs() < 1e-10, (lam - 2.0).abs() < 1e-10
+        safe_lam = torch.where(near0, torch.ones_like(lam), lam)
+        safe_2ml = torch.where(near2, torch.ones_like(lam), 2.0 - lam)
+        # Mask inputs per branch (no inf/NaN in the unused branch) and keep the
+        # power bases strictly inside the inverse domain.
+        y_pos = torch.where(pos, y, torch.zeros_like(y))
+        y_neg = torch.where(pos, torch.zeros_like(y), y)
+        pos_base = (y_pos * safe_lam + 1.0).clamp(min=1e-3)
+        neg_base = (-safe_2ml * y_neg + 1.0).clamp(min=1e-3)
+        pos_val = torch.where(near0, torch.expm1(torch.where(near0, y_pos, torch.zeros_like(y_pos))), pos_base ** (1.0 / safe_lam) - 1.0)
+        neg_val = torch.where(near2, 1.0 - torch.exp(-torch.where(near2, y_neg, torch.zeros_like(y_neg))), 1.0 - neg_base ** (1.0 / safe_2ml))
+        return torch.where(pos, pos_val, neg_val)
+
+    def inverse(self, data, warn=True, bounded=False, margin=DEFAULT_EXTRAPOLATION_MARGIN,
+                stage='prediction', trait_names=None, evaluation_mask=None):
+        """Map normalized attributes back to the original scale.
+
+        With ``bounded=True`` (model predictions), the trait outputs in
+        ``BOUNDED_TRAIT_KEYS`` follow ``prediction_bounds.bounded_inverse``: clip
+        to the fitted observed range +- ``margin`` SDs, fall back to the observed
+        range if the inverse is non-finite, and clip at zero the traits whose
+        fitted values were all nonnegative -- the same rule as the ML baselines.
+        Leave ``bounded=False`` for observed targets, which must not be altered.
+        """
         data = data.clone()
         if not getattr(data, 'normalized', False):
             raise ValueError("Data is not normalized")
@@ -234,28 +358,40 @@ class NormalizeFeatures(BaseTransform):
                 if warn:
                     print(f"Warning: {k_norm} not in data")
                 continue
-            if self.normalizations[k_norm] == 'sincos':
+            mode = self.normalizations[k_norm]
+            if mode == 'sincos':
                 lat = torch.atan2(data[k_norm][:, 0], data[k_norm][:, 1]) * 180 / np.pi
                 lon = torch.atan2(data[k_norm][:, 2], data[k_norm][:, 3]) * 180 / np.pi
                 data[k_norm] = torch.stack([lat, lon], dim=1)
-            elif self.normalizations[k_norm] == 'yj':
+            elif mode in ('yj', 'z', 'logz'):
+                tensor = data[k_norm]
+                values = tensor.detach().double().cpu().numpy()
+                squeeze = values.ndim == 1
+                if squeeze:
+                    values = values[:, None]
                 props = self.props[k_norm]
-                # Undo z-normalization
-                data[k_norm] = data[k_norm] * props['std'].to(data[k_norm].device) + props['mean'].to(data[k_norm].device)
-                # Undo Yeo-Johnson
-                lambdas = props['lambdas'].numpy()
-                data_np = data[k_norm].float().cpu().numpy()
-                for j in range(data_np.shape[1]):
-                    data_np[:, j] = _yj_inverse(data_np[:, j], lambdas[j])
-                data[k_norm] = torch.tensor(data_np, dtype=data[k_norm].dtype, device=data[k_norm].device)
-                if soft_clip and k_norm in {'species_x_mean', 'species_x_min', 'species_x_max'}:
-                    data[k_norm] = soft_clip_lower + torch.nn.functional.softplus(data[k_norm] - soft_clip_lower)
-            elif self.normalizations[k_norm] in ['logz', 'z']:
-                data[k_norm] = data[k_norm] * self.props[k_norm]['std'] + self.props[k_norm]['mean']
-                if self.normalizations[k_norm] == 'logz':
-                    data[k_norm] = torch.exp(data[k_norm]) - 1e-6
-                if soft_clip and k_norm in {'species_x_mean', 'species_x_min', 'species_x_max'}:
-                    data[k_norm] = soft_clip_lower + torch.nn.functional.softplus(data[k_norm] - soft_clip_lower)
+                if bounded and k_norm in self.BOUNDED_TRAIT_KEYS:
+                    if 'observed_min' not in props:
+                        raise ValueError(f'{k_norm}: no fitted observed range; refit the normalization.')
+                    diagnostics = []
+                    restored = bounded_inverse(
+                        lambda z, k=k_norm: self._denormalize_values(k, z), values,
+                        props['observed_min'].numpy(), props['observed_max'].numpy(),
+                        margin=margin, nonnegative=props['nonnegative'].numpy(),
+                        diagnostics=diagnostics, evaluation_mask=evaluation_mask,
+                    )
+                    for row in diagnostics:
+                        column = row.pop('column')
+                        self.prediction_diagnostics.append({
+                            'stage': stage,
+                            'trait': trait_names[column] if trait_names is not None else str(column),
+                            'variable': k_norm.removeprefix('species_x_'), **row,
+                        })
+                else:
+                    restored = self._denormalize_values(k_norm, values)
+                if squeeze:
+                    restored = restored[:, 0]
+                data[k_norm] = torch.tensor(restored, dtype=tensor.dtype, device=tensor.device)
         return data
     
 
@@ -280,28 +416,60 @@ class PlantDataset(InMemoryDataset):
                  invalid_bounds_policy='missing', include_unobserved_species=False):
         self.trait_representation = trait_representation
         self.pivot_feature = 'traits_mean' if self.trait_representation == 'mean_std' else 'traits_min'
-        self.traits_filename = traits_filename or ('Traits.xlsx' if trait_representation == 'mean_std' else 'FernMinMax_all.xlsx')
+        self.traits_filename = traits_filename or ('../.soft_del/Traits.xlsx' if trait_representation == 'mean_std' else 'FernTraits.xlsx')
         self.invalid_bounds_policy = invalid_bounds_policy
         self.include_unobserved_species = include_unobserved_species
         trait_path = Path(root) / self.traits_filename
         if not trait_path.exists():
             raise FileNotFoundError(f'Trait workbook not found: {trait_path}')
         self.traits_fingerprint = hashlib.sha256(trait_path.read_bytes()).hexdigest()[:16]
-        tree_path = next(Path(root).glob('*.nwk'), None)
-        if tree_path is None:
-            raise FileNotFoundError(f'Phylogenetic tree file not found in {root}')
-        self.tree_fingerprint = hashlib.sha256(tree_path.read_bytes()).hexdigest()[:16]
         self.get_traits_df(
             root,
             trait_representation=trait_representation,
             invalid_bounds_policy=invalid_bounds_policy,
         )
         self.trait_names = list(getattr(self, self.pivot_feature).columns)
+        from rpy2 import robjects
+        project_r_lib = Path(__file__).resolve().parent / '.local' / 'r-library'
+        if project_r_lib.is_dir():
+            robjects.r['.libPaths'](robjects.StrVector([str(project_r_lib), *robjects.r['.libPaths']()]))
+        script = Path(__file__).resolve().with_name('ftol_tree.R')
+        robjects.r['source'](str(script))
+        result = robjects.globalenv['build_ftol_tree'](robjects.StrVector(list(getattr(self, self.pivot_feature).index)))
+        self.tree_newick = str(result.rx2('newick')[0])
+        mapping = result.rx2('mapping')
+        self.ftol_mapping = pd.DataFrame({name: list(mapping.rx2(name)) for name in mapping.names})
+        self.ftol_version = str(result.rx2('ftol_version')[0])
+        self.tree_fingerprint = hashlib.sha256(self.tree_newick.encode()).hexdigest()[:16]
+        unresolved = self.ftol_mapping[self.ftol_mapping['placement'].isin(['genus absent', 'genus non-monophyletic', 'shared FTOL tip unresolved', 'invalid terminal length'])]
+        if not unresolved.empty:
+            warnings.warn('FTOL unresolved species: ' + ', '.join(unresolved['species']))
         self.y_index = np.arange(len(self.trait_names))
             
         super().__init__(root, transform, pre_transform, pre_filter)
         self.load(self.processed_paths[0])
-    
+
+    def tree_coverage(self) -> pd.DataFrame:
+        """FTOL placement and tree membership of every analytical taxon.
+
+        ``in_tree`` is read from the reconstructed Newick tips, so it is the
+        authoritative set of taxa that tree-dependent methods can predict.
+        Saved with each run so analyses can identify unresolved taxa from the
+        run's own provenance rather than a hard-coded list.
+        """
+        tips = {str(tip.name) for tip in Phylo.read(io.StringIO(self.tree_newick), 'newick').get_terminals()}
+        species = list(getattr(self, self.pivot_feature).index)
+        mapping = self.ftol_mapping.set_index('species').reindex(species)
+        coverage = pd.DataFrame({
+            'species': species,
+            'ftol_tip': mapping['ftol_tip'].to_numpy(),
+            'placement': mapping['placement'].to_numpy(),
+            'in_tree': [name in tips for name in species],
+        })
+        coverage['ftol_version'] = self.ftol_version
+        coverage['tree_fingerprint'] = self.tree_fingerprint
+        return coverage
+
     @staticmethod
     def load_raster(f, 
                     grid_step=.1, 
@@ -585,10 +753,7 @@ class PlantDataset(InMemoryDataset):
         return df
 
     def get_species_graph(self):
-        tree_file = next(Path(self.root).glob('*.nwk'), None)
-        if tree_file is None:
-            raise RuntimeError('Phylogenetic tree file not found.')
-        tree = Phylo.read(tree_file, "newick") # pyright: ignore[reportPrivateImportUsage]
+        tree = Phylo.read(io.StringIO(self.tree_newick), "newick")
 
         G = nx.Graph()
         for clade in tree.get_nonterminals():  # Internal nodes (non-leaf)
@@ -783,6 +948,32 @@ def data_split(data, test_size=0.3, k=0, seed=42, split_strategy='random'):
         if any((fold_ids == i).sum() == 0 for i in range(5)):
             raise ValueError('Stable split produced an empty test fold.')
         splits = [(np.flatnonzero(fold_ids != i), np.flatnonzero(fold_ids == i)) for i in range(5)]
+    elif split_strategy in ('genus', 'clade'):
+        if split_strategy == 'genus':
+            groups = [name.split('_')[0] for name in data.species_names]
+        else:
+            tree = Phylo.read(io.StringIO(data.tree_newick), 'newick')
+            names = set(data.species_names)
+            clades = [tree.root]
+            # Recursively split the largest available clade until at least five
+            # nonempty blocks exist; each block remains monophyletic.
+            while True:
+                candidates = [(len({t.name for t in c.get_terminals()} & names), i)
+                              for i, c in enumerate(clades) if c.clades]
+                if not candidates:
+                    break
+                size, i = max(candidates)
+                if len(clades) >= 5 and size <= int(np.ceil(n_species / 5)):
+                    break
+                node = clades.pop(i)
+                clades.extend(c for c in node.clades if {t.name for t in c.get_terminals()} & names)
+            tip_group = {tip.name: f'clade_{i}' for i, c in enumerate(clades) for tip in c.get_terminals()}
+            groups = [tip_group.get(name, f'unresolved_{name}') for name in data.species_names]
+        if len(set(groups)) < 5:
+            raise ValueError('At least five distinct groups are required for grouped cross-validation.')
+        splits = list(GroupKFold(n_splits=5).split(np.arange(n_species), groups=groups))
+        if any(len(test) > len(train) for train, test in splits):
+            raise ValueError('A group is too large for a valid five-fold split.')
     elif split_strategy == 'louvain':
         graph = nx.Graph()
         graph.add_nodes_from(range(n_species))
@@ -802,7 +993,7 @@ def data_split(data, test_size=0.3, k=0, seed=42, split_strategy='random'):
         splitter = GroupKFold(n_splits=5)
         splits = list(splitter.split(np.arange(n_species), groups=groups))
     else:
-        raise ValueError("split_strategy must be 'random', 'stable', or 'louvain'.")
+        raise ValueError("Unknown split strategy.")
 
     if not 0 <= k < len(splits):
         raise ValueError(f'Fold index {k} is outside [0, {len(splits) - 1}].')

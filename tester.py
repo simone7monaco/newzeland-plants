@@ -20,6 +20,9 @@ Part 2 — XAI via Integrated Gradients (Captum)
 
 All results are printed, saved to CSV, and plotted to PNG.
 """
+import warnings
+# torch_geometric (<= 2.8.1) calls the deprecated torch.jit.script at import time; silence only that message.
+warnings.filterwarnings('ignore', message='`torch.jit.script` is deprecated', category=FutureWarning)
 
 import torch
 import torch.nn.functional as F
@@ -32,12 +35,15 @@ from scipy import stats as sp_stats
 import warnings
 from torch_geometric.data import Batch
 
+from analysis_utils import AnalysisConsistencyError
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 import wandb
 from occlusion import group_for_trait
+from prediction_bounds import write_safeguard_log
 
 
 # =====================================================================
@@ -147,6 +153,26 @@ def _gaussian_crps(mu, sigma, y):
     )
 
 
+def _error_metrics(prediction, target):
+    """Float64 error arithmetic, scaled before squaring or summing."""
+    p, t = np.asarray(prediction, dtype=np.float64), np.asarray(target, dtype=np.float64)
+    if not (np.isfinite(p).all() and np.isfinite(t).all()):
+        raise AnalysisConsistencyError('Evaluated predictions and targets must be finite before scoring.')
+    with np.errstate(over='ignore', invalid='ignore'):
+        absolute_error = np.abs(p - t)
+    if not np.isfinite(absolute_error).all():
+        raise AnalysisConsistencyError('Evaluated errors exceed the float64 range.')
+    scale = float(absolute_error.max())
+    if scale == 0:
+        return 0.0, 0.0
+    relative_error = absolute_error / scale
+    result = (float(scale * np.sqrt(np.mean(relative_error ** 2))),
+              float(scale * np.mean(relative_error)))
+    if not np.isfinite(result).all():
+        raise AnalysisConsistencyError('Calculated error metrics must be finite.')
+    return result
+
+
 def compute_metrics(pred_mean, pred_std, true_mean, eval_mask, trait_names):
     """
     Per-trait evaluation metrics.
@@ -172,13 +198,11 @@ def compute_metrics(pred_mean, pred_std, true_mean, eval_mask, trait_names):
             records.append(nan_row)
             continue
 
-        p = pred_mean[m, j].cpu().numpy()
-        s = pred_std[m, j].cpu().numpy()
-        t = true_mean[m, j].cpu().numpy()
+        p = pred_mean[m, j].detach().cpu().numpy().astype(np.float64)
+        s = pred_std[m, j].detach().cpu().numpy().astype(np.float64)
+        t = true_mean[m, j].detach().cpu().numpy().astype(np.float64)
 
-        err = p - t
-        rmse = float(np.sqrt(np.mean(err ** 2)))
-        mae = float(np.mean(np.abs(err)))
+        rmse, mae = _error_metrics(p, t)
 
         # Pearson / Spearman
         pr = (
@@ -210,6 +234,93 @@ def compute_metrics(pred_mean, pred_std, true_mean, eval_mask, trait_names):
     return pd.DataFrame(records)
 
 
+def project_ordered_bounds(pred_min: torch.Tensor, pred_max: torch.Tensor):
+    """Euclidean projection of each (min, max) pair onto {min <= max}.
+
+    Reversed pairs are replaced by their midpoint; ordered pairs are unchanged.
+    Because every true pair satisfies min <= max (a convex set), the projection
+    never increases the joint squared error of a pair. Returns the projected
+    bounds and the boolean mask of pairs that were reversed.
+    """
+    reversed_pairs = pred_min > pred_max
+    midpoint = pred_min / 2 + pred_max / 2
+    return (torch.where(reversed_pairs, midpoint, pred_min),
+            torch.where(reversed_pairs, midpoint, pred_max),
+            reversed_pairs)
+
+
+def count_reversed_bounds(pred_min: torch.Tensor, pred_max: torch.Tensor, eval_mask: torch.Tensor,
+                          trait_names, projected: bool) -> pd.DataFrame:
+    """Per-trait count of reversed (min > max) predictions, taken BEFORE any projection.
+
+    Only pairs with two finite predictions are counted; the ``n_eval_*`` columns
+    restrict the same counts to the cells that are scored.
+    """
+    pred_min, pred_max = pred_min.detach().cpu(), pred_max.detach().cpu()
+    finite = torch.isfinite(pred_min) & torch.isfinite(pred_max)
+    reversed_pairs = finite & (pred_min > pred_max)
+    evaluated = eval_mask.detach().cpu().bool() & finite
+    gap = torch.where(reversed_pairs, pred_min - pred_max, torch.zeros_like(pred_min))
+    table = pd.DataFrame({
+        'trait': list(trait_names),
+        'n_pairs': finite.sum(0).numpy(),
+        'n_reversed': reversed_pairs.sum(0).numpy(),
+        'n_eval_pairs': evaluated.sum(0).numpy(),
+        'n_eval_reversed': (reversed_pairs & evaluated).sum(0).numpy(),
+        'max_reversal': gap.amax(0).numpy(),
+        'projected': bool(projected),
+    })
+    table['pct_reversed'] = 100 * table.n_reversed / table.n_pairs.clip(lower=1)
+    return table
+
+
+PREDICTION_SCALE = 'original'
+LONG_PREDICTION_COLUMNS = ('species', 'fold', 'trait', 'variable', 'observed', 'predicted', 'evaluated', 'scale')
+
+
+def long_predictions_frame(species_names, fold: str, trait_names, predictions: dict, truths: dict,
+                           eval_mask: torch.Tensor, observed_mask: torch.Tensor) -> pd.DataFrame:
+    """One row per test species x trait x bound, on the original measurement scale.
+
+    Shared by the GNN tester and the baselines so that every model exports the
+    same columns. ``observed`` is NaN where the cell was not recorded,
+    ``evaluated`` marks the cells actually scored by that model, and ``scale``
+    makes the measurement scale explicit for downstream consistency checks.
+    """
+    observed_mask = observed_mask.detach().cpu().bool().numpy()
+    eval_np = eval_mask.detach().cpu().bool().numpy()
+    if eval_np.shape != observed_mask.shape:
+        raise ValueError(f'eval_mask {eval_np.shape} does not match observed_mask {observed_mask.shape}')
+    if (eval_np & ~observed_mask).any():
+        raise ValueError('Evaluated cells must be originally observed.')
+    for variable in ('min', 'max'):
+        bad = eval_np & ~np.isfinite(predictions[variable].detach().cpu().numpy().astype(np.float64))
+        if bad.any():
+            # Fail at the fold that produced them, not after the whole benchmark.
+            rows, cols = np.nonzero(bad)
+            examples = [(species_names[r], trait_names[c]) for r, c in zip(rows[:5], cols[:5])]
+            raise AnalysisConsistencyError(
+                f'fold {fold}: {int(bad.sum())} evaluated {variable} cells have non-finite predictions, e.g. {examples}'
+            )
+    frames = []
+    for variable in ('min', 'max'):
+        predicted = predictions[variable].detach().cpu().numpy().astype(np.float64)
+        observed = truths[variable].detach().cpu().numpy().astype(np.float64)
+        observed = np.where(observed_mask, observed, np.nan)
+        n_species, n_traits = predicted.shape
+        frames.append(pd.DataFrame({
+            'species': np.repeat(np.asarray(species_names, dtype=object), n_traits),
+            'fold': fold,
+            'trait': np.tile(np.asarray(trait_names, dtype=object), n_species),
+            'variable': variable,
+            'observed': observed.reshape(-1),
+            'predicted': predicted.reshape(-1),
+            'evaluated': eval_np.reshape(-1),
+            'scale': PREDICTION_SCALE,
+        }))
+    return pd.concat(frames, ignore_index=True)[list(LONG_PREDICTION_COLUMNS)]
+
+
 def compute_metrics_minmax(pred_min, pred_max, pred_range, true_min, true_max, true_range, eval_mask, trait_names):
     """
     Compute per-trait, per-variable metrics for min/max/range predictions.
@@ -227,21 +338,19 @@ def compute_metrics_minmax(pred_min, pred_max, pred_range, true_min, true_max, t
                 records.append(dict(trait=trait_names[j], variable=var, n=n_eval, RMSE=np.nan, MAE=np.nan, Pearson_r=np.nan, Spearman_rho=np.nan))
             continue
 
-        pmin = pred_min[m, j].cpu().numpy()
-        pmax = pred_max[m, j].cpu().numpy()
-        tmin = true_min[m, j].cpu().numpy()
-        tmax = true_max[m, j].cpu().numpy()
+        pmin = pred_min[m, j].detach().cpu().numpy().astype(np.float64)
+        pmax = pred_max[m, j].detach().cpu().numpy().astype(np.float64)
+        tmin = true_min[m, j].detach().cpu().numpy().astype(np.float64)
+        tmax = true_max[m, j].detach().cpu().numpy().astype(np.float64)
         if pred_range is not None:
-            pr = pred_range[m, j].cpu().numpy()
-            tr = true_range[m, j].cpu().numpy()
+            pr = pred_range[m, j].detach().cpu().numpy().astype(np.float64)
+            tr = true_range[m, j].detach().cpu().numpy().astype(np.float64)
             metric_tuples = [('min', pmin, tmin), ('max', pmax, tmax), ('range', pr, tr)]
         else:
             metric_tuples = [('min', pmin, tmin), ('max', pmax, tmax)]
 
         for name, p, t in metric_tuples:
-            err = p - t
-            rmse = float(np.sqrt(np.mean(err ** 2)))
-            mae = float(np.mean(np.abs(err)))
+            rmse, mae = _error_metrics(p, t)
             pr_val = float(np.corrcoef(p, t)[0, 1]) if np.std(p) > 1e-12 and np.std(t) > 1e-12 else np.nan
             sr = float(sp_stats.spearmanr(p, t).statistic) if n_eval > 2 else np.nan # type: ignore
             records.append(dict(trait=trait_names[j], variable=name, n=n_eval, RMSE=rmse, MAE=mae, Pearson_r=pr_val, Spearman_rho=sr))
@@ -1214,6 +1323,8 @@ class Tester:
         self._orig_min_dfs: list[pd.DataFrame] = []
         self._orig_max_dfs: list[pd.DataFrame] = []
         self._orig_range_dfs: list[pd.DataFrame] = []
+        # Per-fold counts of reversed (min > max) predictions before projection
+        self._bounds_order_dfs: list[pd.DataFrame] = []
 
     @torch.no_grad()
     def test_routine(self, model, data, norm_transform, trait_names,
@@ -1222,7 +1333,9 @@ class Tester:
                     gen_col_names=None, env_col_names=None,
                     conformal_alpha=0.10,
                     conformal_calibration=None,
-                    log_wandb=True):
+                    log_wandb=True,
+                    enforce_bounds_order=True,
+                    original_truth=None):
         """
         Full evaluation pipeline (call after training, with best weights loaded).
 
@@ -1243,6 +1356,11 @@ class Tester:
         env_col_names  : list[str] | None  environmental feature column names
         conformal_calibration : pd.DataFrame | None  Bounds fitted on an
                        independent inner-validation mask
+        original_truth : dict | None  Untransformed ``{'min', 'max'}`` trait
+                       tensors for all species (min/max mode). When given,
+                       original-scale metrics and exports use these exact
+                       recorded values, as the baselines do, instead of an
+                       inverse-transformed round trip.
         """
         save_dir = Path(save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
@@ -1308,7 +1426,11 @@ class Tester:
             d_tmp = data.clone().cpu()
             d_tmp.species_x_mean = pred_mean.cpu()
             d_tmp.species_x_std = pred_std.cpu()
-            d_unnorm = norm_transform.inverse(d_tmp, warn=False, soft_clip=True)
+            d_unnorm = norm_transform.inverse(
+                d_tmp, warn=False, bounded=True, stage='test', trait_names=trait_names,
+                evaluation_mask=eval_mask.detach().cpu().numpy(),
+            )
+            write_safeguard_log(norm_transform.prediction_diagnostics, save_dir / 'prediction_safeguards.csv')
             inv_pred = d_unnorm.species_x_mean
             inv_std = d_unnorm.species_x_std
             inv_true = norm_transform.inverse(data.clone().cpu(), warn=False).species_x_mean[test_indices.cpu()]
@@ -1324,12 +1446,15 @@ class Tester:
             self.conformal_reliable_mask = conformal_reliable_mask
             self.explainability_eval_mask = eval_mask.cpu() & conformal_reliable_mask
         else:
-            # min_max_range branch: save raw normalized predictions
-            pd.DataFrame(pred_min.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_min.csv")
-            pd.DataFrame(pred_max.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_max.csv")
+            # min_max_range branch: network outputs on the fold-specific
+            # normalized scale are kept only as an explicitly named diagnostic;
+            # predictions_{min,max}.csv below are on the original scale, as for
+            # every baseline.
+            pd.DataFrame(pred_min.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_min_normalized.csv")
+            pd.DataFrame(pred_max.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_max_normalized.csv")
 
             if pred_range is not None:
-                pd.DataFrame(pred_range.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_range.csv")
+                pd.DataFrame(pred_range.cpu().numpy(), index=species_names, columns=trait_names).to_csv(save_dir / "predictions_range_normalized.csv")
 
             # -- original-space metrics --
             d_tmp = data.clone().cpu()
@@ -1337,14 +1462,31 @@ class Tester:
             d_tmp.species_x_max = pred_max.cpu()
             if pred_range is not None:
                 d_tmp.species_x_range = pred_range.cpu()
-            d_unnorm = norm_transform.inverse(d_tmp, warn=False, soft_clip=True)
+            d_unnorm = norm_transform.inverse(
+                d_tmp, warn=False, bounded=True, stage='test', trait_names=trait_names,
+                evaluation_mask=eval_mask.detach().cpu().numpy(),
+            )
+            write_safeguard_log(norm_transform.prediction_diagnostics, save_dir / 'prediction_safeguards.csv')
             inv_min = d_unnorm.species_x_min
             inv_max = d_unnorm.species_x_max
+            # Count reversed pairs on the raw predictions, whether or not they are projected.
+            bounds_order = count_reversed_bounds(inv_min, inv_max, eval_mask, trait_names, enforce_bounds_order)
+            bounds_order.to_csv(save_dir / "bounds_order.csv", index=False)
+            self._bounds_order_dfs.append(bounds_order.assign(fold=save_dir.name))
+            action = 'set to their midpoint' if enforce_bounds_order else 'left unchanged (projection disabled)'
+            print(f"Bounds order: {int(bounds_order.n_reversed.sum())} of {int(bounds_order.n_pairs.sum())} test (min, max) pairs reversed "
+                  f"({int(bounds_order.n_eval_reversed.sum())} among evaluated cells); {action}.")
+            if enforce_bounds_order:
+                inv_min, inv_max, _ = project_ordered_bounds(inv_min, inv_max)
             
             inv_range = d_unnorm.species_x_range if pred_range is not None else None
             data_unnorm = norm_transform.inverse(data.clone().cpu(), warn=False)
-            true_min_unn = data_unnorm.species_x_min[test_indices.cpu()]
-            true_max_unn = data_unnorm.species_x_max[test_indices.cpu()]
+            if original_truth is not None:
+                true_min_unn = original_truth['min'].detach().cpu()[test_indices.cpu()]
+                true_max_unn = original_truth['max'].detach().cpu()[test_indices.cpu()]
+            else:
+                true_min_unn = data_unnorm.species_x_min[test_indices.cpu()]
+                true_max_unn = data_unnorm.species_x_max[test_indices.cpu()]
             true_range_unn = data_unnorm.species_x_range[test_indices.cpu()] if pred_range is not None else None
 
 
@@ -1382,16 +1524,23 @@ class Tester:
             print("\nConformal residual bounds (original space):")
             print(conformal_bounds.to_string(index=False, float_format="%.4f"))
 
+            # Original-scale, order-projected predictions: the same file names
+            # and scale as the baselines' per-fold exports.
             orig_min_df = pd.DataFrame(inv_min.cpu().numpy(), index=species_names, columns=trait_names)
             orig_max_df = pd.DataFrame(inv_max.cpu().numpy(), index=species_names, columns=trait_names)
-            orig_min_df.to_csv(save_dir / "predictions_min_original.csv")
-            orig_max_df.to_csv(save_dir / "predictions_max_original.csv")
+            orig_min_df.to_csv(save_dir / "predictions_min.csv")
+            orig_max_df.to_csv(save_dir / "predictions_max.csv")
             self._orig_min_dfs.append(orig_min_df)
             self._orig_max_dfs.append(orig_max_df)
             if inv_range is not None:
                 orig_range_df = pd.DataFrame(inv_range.cpu().numpy(), index=species_names, columns=trait_names)
-                orig_range_df.to_csv(save_dir / "predictions_range_original.csv")
+                orig_range_df.to_csv(save_dir / "predictions_range.csv")
                 self._orig_range_dfs.append(orig_range_df)
+            long_predictions_frame(
+                species_names, save_dir.name, trait_names,
+                {'min': inv_min, 'max': inv_max}, {'min': true_min_unn, 'max': true_max_unn},
+                eval_mask, ~data.traits_nanmask[test_indices],
+            ).to_csv(save_dir / "predictions_long.csv", index=False)
 
         # -- plots (Part 1) --
         if trait_mode == 'mean_std':
@@ -1400,9 +1549,9 @@ class Tester:
             _plot_scatter_pred_vs_true(pred_mean, true_mean, eval_mask, trait_names, save_dir / "scatter_pred_vs_true.png")
             self.scatterplot_paths = _plot_scatter_pred_vs_true_per_trait(pred_mean, true_mean, eval_mask, trait_names, save_dir / "scatterplots")
         else:
-            # For min/max/range, produce variable-specific scatter plots
-            _plot_scatter_pred_vs_true(pred_min, true_min, eval_mask, trait_names, save_dir / "scatter_pred_vs_true_min.png")
-            _plot_scatter_pred_vs_true(pred_max, true_max, eval_mask, trait_names, save_dir / "scatter_pred_vs_true_max.png")
+            # For min/max/range, produce variable-specific scatter plots in original units
+            _plot_scatter_pred_vs_true(inv_min, true_min_unn, eval_mask.cpu(), trait_names, save_dir / "scatter_pred_vs_true_min.png")
+            _plot_scatter_pred_vs_true(inv_max, true_max_unn, eval_mask.cpu(), trait_names, save_dir / "scatter_pred_vs_true_max.png")
             paths_min = _plot_scatter_pred_vs_true_per_trait(pred_min, true_min, eval_mask, trait_names, save_dir / "scatterplots_min")
             paths_max = _plot_scatter_pred_vs_true_per_trait(pred_max, true_max, eval_mask, trait_names, save_dir / "scatterplots_max")
             self.scatterplot_paths = paths_min + paths_max 
@@ -1559,6 +1708,7 @@ class Tester:
             merged.index.name = "species"
             merged.to_csv(save_dir / "predictions_original_all_folds.csv")
             print(f"Merged original-space predictions saved to {save_dir}/predictions_original_all_folds.csv")
+            self.bounds_order_summary().to_csv(save_dir / "bounds_order_all_folds.csv", index=False)
             return
         if not self._orig_mean_dfs:
             print("No original-space predictions to merge. Run test_routine() first.")
@@ -1577,7 +1727,28 @@ class Tester:
         merged.to_csv(save_dir / "predictions_original_all_folds.csv")
         print(f"Merged original-space predictions saved to {save_dir}/predictions_original_all_folds.csv")
 
+    def bounds_order_summary(self) -> pd.DataFrame:
+        """Reversed (min > max) predictions per trait, summed over folds (before projection)."""
+        if not self._bounds_order_dfs:
+            return pd.DataFrame()
+        folds = pd.concat(self._bounds_order_dfs)
+        summary = folds.groupby('trait', sort=False).agg(
+            n_pairs=('n_pairs', 'sum'), n_reversed=('n_reversed', 'sum'),
+            n_eval_pairs=('n_eval_pairs', 'sum'), n_eval_reversed=('n_eval_reversed', 'sum'),
+            max_reversal=('max_reversal', 'max'), projected=('projected', 'all'),
+        ).reset_index()
+        summary['pct_reversed'] = 100 * summary.n_reversed / summary.n_pairs.clip(lower=1)
+        return summary
+
     def sanity_checks(self):
+        summary = self.bounds_order_summary()
+        if not summary.empty:
+            total, reversed_total = int(summary.n_pairs.sum()), int(summary.n_reversed.sum())
+            status = 'projected to midpoint' if summary.projected.all() else 'NOT projected'
+            print(f"Bounds order: {reversed_total}/{total} test pairs had min > max before projection "
+                  f"({100 * reversed_total / max(total, 1):.2f}%; {status}).")
+            if reversed_total:
+                print(summary[summary.n_reversed > 0].to_string(index=False, float_format='%.4g'))
         if getattr(self, 'trait_mode', 'mean_std') == 'mean_std':
             self.metrics = self.metrics.groupby("trait").agg({
                 "n": "sum",

@@ -1,11 +1,97 @@
-# Configuration
+# Where does information about plant trait variation reside? A predictive analysis of phylogenetic and environmental information in New Zealand ferns
 
-Creazione R Environment
+*Manuscript submitted to Biological Informatics*
 
-micromamba create -f environment.yml -y
+## Introduction
 
-Create python environment using uv
+This repository contains the analysis code for **PhyEnv-NN**, a graph neural network framework developed to assess how phylogenetic history and environmental conditions contribute predictive information about fern morphological traits. The study evaluates trait imputation across New Zealand ferns and compares models with different combinations of environmental and phylogenetic inputs against statistical and machine-learning baselines. Five-fold species-level cross-validation and controlled trait masking provide the common evaluation setting; the benchmark runner repeats this workflow across seeds and aggregates model predictions and metrics.
+
+The model represents species, traits and environmental information in a graph, and predicts unobserved species–trait values from the remaining observed information. The benchmark includes GNN feature ablations, non-graph machine-learning baselines and R-based methods, including MICE and Rphylopars.
+
+## Installation
+
+The project requires Python 3.12, `uv`, R 4.5.3 and `micromamba` for the R baseline environment. Python packages are declared in `pyproject.toml` and locked in `uv.lock`; the `data` and `baselines` dependency groups separate dataset/phylogeny support from the Python baseline implementations. PyTorch and the PyTorch Geometric extensions are configured for CUDA 13.0. Adjust the PyTorch indexes and packages for a different accelerator or CPU-only installation before synchronizing the environment.
+
+From the repository root, install the locked Python environment:
+
+```bash
 uv sync --frozen
+```
 
-To run the baselines:
-run_baselines.sh
+The `data` and `baselines` groups are installed by default. To create a smaller environment for training without the Python baseline implementations, use `uv sync --frozen --no-default-groups --group data`.
+
+Create the R environment used by the statistical baselines:
+
+```bash
+micromamba create -f environment.yml -y
+```
+
+Install the R packages used for phylogeny construction into that environment:
+
+```bash
+micromamba run -n r-baselines Rscript r-data-dependencies.R
+```
+
+Python accesses R through `rpy2`; configure `R_HOME` and `R_LIBS_USER` if the selected R installation or library is non-default. The R baseline environment installs `mice`, `rpart`, `missForest`, `Rphylopars` and `ape`; `RPY2_CFFI_MODE=ABI` is set in `environment.yml`.
+
+The analytical trait workbook is expected at `data/Ferns/FernTraits.xlsx`. Source data are not distributed with the code repository. Provide the required workbook and ensure that the R packages and their source data are available before running the graph loader or full benchmark.
+
+For this small dataset, limit numerical-library threading before running training or baselines. ML search parallelism is controlled separately by `--n_jobs`, and seed-suite parallelism by `--parallel-seeds`:
+
+```bash
+export OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+```
+
+`r_baselines_fit.py` sets `OPENBLAS_NUM_THREADS=1` itself when it is not already exported: with threaded OpenBLAS on a loaded machine, MICE's per-variable `eigen()` calls (`mice::remove.lindep`) made one fold take tens of minutes.
+
+## Model training
+
+Run `train.py` from the repository root. By default, it trains the model over all five folds with seed 42, environmental and phylogenetic features, paired trait occlusion, and saves results under `results/`:
+
+```bash
+micromamba run -n r-baselines bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; exec uv run --frozen python train.py'
+```
+
+For example, specify a seed, output directory and split strategy as follows:
+
+```bash
+micromamba run -n r-baselines bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; exec uv run --frozen python train.py --seed 42 --split_strategy random --k -1 --output_dir results/seed_42'
+```
+
+Use `--k 0` through `--k 4` to run one fold; `--k -1` runs all folds sequentially. Important options include `--use_env_features`, `--use_phylo_features`, `--occlusion_protocol` (`paired` or `individual`), `--split_strategy` (`random`, `stable`, `louvain`, `genus` or `clade`), `--epochs` and `--compute_xai`. Run `uv run --frozen python train.py --help` for the complete option list. Training writes fold-level metrics, predictions and model artifacts to the selected output directory.
+
+## Repeated benchmark
+
+`run_benchmark.py` orchestrates the full comparative evaluation: R and Python baselines plus four GNN input configurations (environment and phylogeny together, either source alone, and neither source). It repeats the five-fold workflow for a consecutive sequence of seeds, reuses completed outputs when resuming, and aggregates the results. For each baseline and GNN job, it activates the `r-baselines` environment, sets the shared-library path required by `rpy2`, and invokes the Python environment. MICE, random forest, XGBoost and MLP run with all four supported environmental/phylogenetic input combinations; trait/tree-only reference baselines run once per seed.
+
+Run a benchmark for three seeds beginning at 42:
+
+```bash
+uv run --frozen python run_benchmark.py 3 --start-seed 42 --output-dir benchmark_results
+```
+
+If `<output-dir>/hyperparameters.yaml` exists, the runner passes its `models` mapping (model → trait → estimator parameters) to the ML baselines and skips their inner search. Without it, the usual randomized search runs. Its SHA-256 is recorded in the manifest and changes prevent resuming. The currently selected file was derived from evaluation splits and therefore supports exploratory runs only; select parameters independently for an unbiased benchmark. Baselines can also receive the file directly with `--fixed_hyperparameters`.
+
+The full run computes model explanations (XAI) for GNN configurations and can require substantial runtime and storage. Use a new or matching output directory when starting a benchmark: the runner records a manifest and checks that settings and input fingerprints remain consistent on resume. Additional options include `--split-strategy`, `--occlusion-protocol`, `--include-unobserved-species`, `--result-file` and `--log-level`; see `uv run --frozen python run_benchmark.py --help` for details.
+
+## Baseline models only
+
+Run `r_baselines_fit.py` directly to fit selected baselines without training the GNN. For example, fit only the training-mean baseline on fold 0 with seed 42:
+
+```bash
+micromamba run -n r-baselines bash -c 'export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"; exec uv run --frozen python r_baselines_fit.py --baseline_models training_mean --k 0 --seed 42 --output_dir baseline_results/seed_42'
+```
+
+Replace `training_mean` with a comma-separated selection to run multiple methods. `r_baselines_fit.py` also accepts `training_median`, `phylo_nn`, `phylo_knn`, `rphylopars_bm`, `mice`, `missforest`, `random_forest`, `xgboost` and `mlp`; `missforest` is available here but is not part of the standard `run_benchmark.py` method set. Use `--k -1` to run all five folds. The output directory contains fold-level predictions and metrics; choose a fresh directory for each independent run. Environmental or phylogenetic covariates can be enabled with `--use_env_features` and `--use_phylo_features` for the supported methods. Add `--all_feature_combinations` to run all four combinations for each supported model, while running trait/tree-only methods once. MissForest requires `--training_protocol 2`; the standard suite uses protocol 1.
+
+## Outputs and reproducibility
+
+Training and benchmark artifacts are written beneath the selected output directory; benchmark runs are organized under `runs/` with merged outputs at the benchmark root. Every model (GNN and baselines) writes per-fold `predictions_min.csv`, `predictions_max.csv` and `predictions_long.csv` in original measurement units; the GNN's network outputs are kept separately as `predictions_*_normalized.csv`. Each run also saves `ftol_mapping.csv` with the FTOL placement and tree membership of every taxon. The benchmark refuses outputs that are not on the original scale. The manifest records code hashes, Python package versions, R, R-package and FTOL-data versions, seeds, split and occlusion settings, and input fingerprints (including the project R library). Preserve the input workbook and generated phylogeny alongside results when reproducing an analysis.
+
+GNN and RF/XGBoost/MLP folds also write `prediction_safeguards.csv`: correction counts per trait/bound, with separate GNN calibration/test stages and counts restricted to evaluated cells. Raw infinities are rejected before clipping; RMSE/MAE use float64 and scaled arithmetic. See [prediction safeguards](docs/methodology/prediction-safeguards.md). The manifest hashes the shared safeguard module, so changed code requires a fresh output directory.
+
+## Analysis notebooks
+
+The notebooks in `notebooks/` take trait, bound, configuration, model and environmental-feature names and orderings from `analysis_utils.py`. `01_benchmark_analysis.ipynb` loads the original-scale predictions of a `run_benchmark.py` output directory, checks folds, observed values and scales across models, restricts comparisons with baselines to the taxa that every method can predict (the 182 taxa in the reconstructed tree) and computes fold-pooled metrics; any inconsistency raises `AnalysisConsistencyError`. See `docs/experiments/analysis-conventions.md`. Dataset files, model checkpoints, caches and result directories are excluded from version control.

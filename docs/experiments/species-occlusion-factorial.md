@@ -9,15 +9,15 @@ sources:
   - {resource: ../../run_species_occlusion_experiment.py, title: Factorial benchmark runner}
   - {resource: ../../summarize_species_occlusion.py, title: Common-species outcome analysis}
   - {resource: ../../loader.py, title: Stable species folds}
-  - {resource: ../../data/Ferns/FernMinMax.xlsx, title: Limited species dataset}
+  - {resource: ../../data/.soft_del/FernMinMax.xlsx, title: Limited species dataset}
   - {resource: ../../data/Ferns/FernMinMax_all.xlsx, title: Complete species dataset}
 ---
 
 # Species coverage by occlusion factorial benchmark
 
-**Historical experiment:** the completed run used the earlier 207-node configuration, including a taxon without observed traits. The current default is 206 taxa; do not treat the historical results as a 206-node rerun.
+**Historical experiment:** the completed run used the earlier 207-node configuration, including a taxon without observed traits. The current analytical workbook has 189 rows, all with recorded traits; do not treat the historical results as a rerun of this cohort.
 
-New runs of this script use the current 206-taxon default. They therefore require separate output and do not reproduce the completed 207-node run by default. The underlying training and baseline commands also expose an option to include taxa without observed traits.
+The current standard analytical workbook contains 189 taxa. This historical script explicitly selects its input workbooks, so its runs must be identified by those inputs rather than assumed to use the current standard cohort. They require separate output and do not reproduce the completed 207-node run by default.
 
 Four conditions cross the limited (170 species) and complete (207 species) workbooks with individual-trait and paired fertile/sterile occlusion. The comparison uses one seed (42), 1,000 training epochs, five outer species folds, independent min/max output heads, and the full environment-plus-phylogeny GNN. It also runs the existing six baseline models under the same protocol. Integrated Gradients is disabled because the question concerns predictive errors. The one-seed design is exploratory and does not quantify variability over dataset splits and training randomness.
 
